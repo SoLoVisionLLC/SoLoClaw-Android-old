@@ -61,5 +61,7 @@ data class AppUiState(
     val creatingRoom: Boolean = false,
     val newRoomTitle: String = "",
     val newRoomPurpose: String = "",
-    val selectedAgentIds: Set<String> = emptySet()
+    val selectedAgentIds: Set<String> = emptySet(),
+    val isWorking: Boolean = false,
+    val errorMessage: String? = null
 )

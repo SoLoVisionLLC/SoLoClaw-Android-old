@@ -84,6 +84,14 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
             item { HeroCard() }
+            if (uiState.isWorking || uiState.errorMessage != null) {
+                item {
+                    StatusBanner(
+                        message = uiState.errorMessage ?: "Contacting the OpenClaw gateway…",
+                        isError = uiState.errorMessage != null
+                    )
+                }
+            }
             item { SectionTitle("Agents") }
             items(uiState.agents) { agent -> AgentCard(agent) }
             item { SectionTitle("Collaboration Rooms") }
@@ -276,4 +284,21 @@ private fun VoicePreviewCard() {
 @Composable
 private fun SectionTitle(text: String) {
     Text(text = text, style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onBackground)
+}
+
+@Composable
+private fun StatusBanner(message: String, isError: Boolean) {
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isError) Color(0xFF4C1D24) else MaterialTheme.colorScheme.surface
+        )
+    ) {
+        Text(
+            text = message,
+            modifier = Modifier.padding(16.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (isError) Color(0xFFFFD7DE) else MaterialTheme.colorScheme.onSurface
+        )
+    }
 }

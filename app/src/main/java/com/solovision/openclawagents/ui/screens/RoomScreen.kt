@@ -88,6 +88,14 @@ fun RoomScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            if (uiState.isWorking || uiState.errorMessage != null) {
+                item {
+                    StatusBanner(
+                        message = uiState.errorMessage ?: "Talking to the OpenClaw gateway…",
+                        isError = uiState.errorMessage != null
+                    )
+                }
+            }
             item {
                 TtsControlCard(
                     queueCount = uiState.ttsState.queueCount,
@@ -225,5 +233,22 @@ private fun ComposerBar(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun StatusBanner(message: String, isError: Boolean) {
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isError) Color(0xFF4C1D24) else MaterialTheme.colorScheme.surface
+        )
+    ) {
+        Text(
+            text = message,
+            modifier = Modifier.padding(16.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (isError) Color(0xFFFFD7DE) else MaterialTheme.colorScheme.onSurface
+        )
     }
 }

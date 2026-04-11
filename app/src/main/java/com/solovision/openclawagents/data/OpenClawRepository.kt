@@ -7,6 +7,7 @@ import com.solovision.openclawagents.model.MessageSenderType
 import com.solovision.openclawagents.model.RoomMessage
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -14,6 +15,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
@@ -118,9 +120,9 @@ class GatewayRpcOpenClawTransport(
 ) : OpenClawTransport {
 
     private val deviceAuthStore = OpenClawDeviceAuthStore(context)
-    private val deviceIdentity = OpenClawDeviceIdentity(
-        alias = "${context.packageName}.openclaw.device"
-    )
+    private val deviceIdentity = OpenClawDeviceIdentity(deviceAuthStore)
+    private val localRooms = linkedMapOf<String, CollaborationRoom>()
+    private val localMessages = linkedMapOf<String, MutableList<RoomMessage>>()
 
     private val client = okHttpClient ?: OkHttpClient.Builder()
         .pingInterval(30, TimeUnit.SECONDS)
@@ -141,7 +143,7 @@ class GatewayRpcOpenClawTransport(
         val matched = sessions.mapNotNull { it as? Map<*, *> }
             .filter { (it["key"] as? String) == config.sessionKey }
 
-        if (matched.isEmpty()) {
+        val remoteRooms = if (matched.isEmpty()) {
             listOf(
                 CollaborationRoom(
                     id = config.sessionKey,
@@ -167,9 +169,14 @@ class GatewayRpcOpenClawTransport(
                 )
             }
         }
+
+        return@withContext (localRooms.values.toList() + remoteRooms)
+            .distinctBy { it.id }
     }
 
     override suspend fun fetchRoomMessages(roomId: String): List<RoomMessage> = withContext(dispatcher) {
+        localMessages[roomId]?.let { return@withContext it.toList() }
+
         val response = request(
             method = "chat.history",
             params = mapOf(
@@ -222,28 +229,70 @@ class GatewayRpcOpenClawTransport(
 
     override suspend fun sendRoomMessage(request: SendRoomMessageRequest) {
         withContext(dispatcher) {
+            localMessages[request.roomId]?.let { roomMessages ->
+                roomMessages += RoomMessage(
+                    id = "local-user-${System.currentTimeMillis()}",
+                    senderId = "solo",
+                    senderName = "SoLo",
+                    senderRole = "Operator",
+                    senderType = MessageSenderType.USER,
+                    body = request.text,
+                    timestampLabel = "Now"
+                )
+                roomMessages += RoomMessage(
+                    id = "local-system-${System.currentTimeMillis()}",
+                    senderId = "system",
+                    senderName = "System",
+                    senderRole = "Local Room",
+                    senderType = MessageSenderType.SYSTEM,
+                    body = "This room exists locally in the app. Backend room sync is not wired yet.",
+                    timestampLabel = "Now"
+                )
+                return@withContext
+            }
+
+            Log.d(
+                "OpenClawGateway",
+                "chat.send sessionKey=${request.roomId} length=${request.text.length} deliver=true"
+            )
             this@GatewayRpcOpenClawTransport.request(
                 method = "chat.send",
                 params = mapOf(
                     "sessionKey" to request.roomId,
                     "message" to request.text,
-                    "deliver" to false,
+                    "deliver" to true,
+                    "thinking" to "medium",
+                    "timeoutMs" to 30_000,
                     "idempotencyKey" to "android-${System.currentTimeMillis()}"
                 )
             )
+            delay(500)
         }
     }
 
     override suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom {
-        return CollaborationRoom(
-            id = config.sessionKey,
+        val room = CollaborationRoom(
+            id = "local-room-${System.currentTimeMillis()}",
             title = request.title.ifBlank { friendlySessionTitle(config.sessionKey) },
             purpose = request.purpose.ifBlank { "Live OpenClaw session" },
             members = request.agentIds.ifEmpty { listOf(agentIdFromSessionKey(config.sessionKey)) },
             unreadCount = 0,
             active = true,
-            lastActivity = "Live"
+            lastActivity = "Now"
         )
+        localRooms[room.id] = room
+        localMessages[room.id] = mutableListOf(
+            RoomMessage(
+                id = "local-room-created-${System.currentTimeMillis()}",
+                senderId = "system",
+                senderName = "System",
+                senderRole = "Room Created",
+                senderType = MessageSenderType.SYSTEM,
+                body = "Room created locally with ${room.members.size} agents. Backend room creation is not available yet.",
+                timestampLabel = "Now"
+            )
+        )
+        return room
     }
 
     private suspend fun request(method: String, params: Map<String, Any?>): Map<String, Any?> = withContext(dispatcher) {
@@ -296,34 +345,39 @@ class GatewayRpcOpenClawTransport(
             }
 
             fun buildConnectParams(nonce: String?): Map<String, Any?> {
+                val sharedToken = config.apiKey?.takeIf { it.isNotBlank() }
                 val auth = buildMap<String, Any?> {
-                    config.apiKey?.takeIf { it.isNotBlank() }?.let { put("token", it) }
+                    sharedToken?.let { put("token", it) }
                     config.password?.takeIf { it.isNotBlank() }?.let { put("password", it) }
-                    deviceToken?.takeIf { it.isNotBlank() }?.let { put("deviceToken", it) }
                 }.takeIf { it.isNotEmpty() }
 
                 val device = nonce?.takeIf { it.isNotBlank() }?.let { challenge ->
                     val signedAt = System.currentTimeMillis()
                     val deviceId = deviceIdentity.deviceId()
                     val publicKey = deviceIdentity.publicKeyBase64Url()
-                    val requestedScopes = listOf("operator.admin", "operator.read", "operator.write", "operator.approvals", "operator.pairing")
-                    val payload = listOf(
-                        "v3",
-                        deviceId,
-                        clientId,
-                        "control-ui",
-                        "operator",
-                        requestedScopes.joinToString(","),
-                        signedAt.toString(),
-                        deviceToken.orEmpty(),
-                        challenge,
-                        "Android",
-                        "phone"
-                    ).joinToString("|")
+                    val requestedScopes = listOf("operator.read", "operator.write", "operator.talk.secrets")
+                    val payload = buildDeviceAuthPayloadV3(
+                        deviceId = deviceId,
+                        clientId = clientId,
+                        clientMode = "ui",
+                        role = "operator",
+                        scopes = requestedScopes,
+                        signedAtMs = signedAt,
+                        token = sharedToken,
+                        nonce = challenge,
+                        platform = "android",
+                        deviceFamily = "Android"
+                    )
+                    val signature = deviceIdentity.signPayload(payload)
+                    val selfVerified = deviceIdentity.verifySelfSignature(payload, signature)
+                    Log.d(
+                        "OpenClawGateway",
+                        "Device auth payload deviceId=$deviceId publicKeyRawSize=${deviceIdentity.publicKeyRawSize()} payloadSha256=${sha256Hex(payload)} signatureChars=${signature.length} selfVerified=$selfVerified"
+                    )
                     mapOf(
                         "id" to deviceId,
                         "publicKey" to publicKey,
-                        "signature" to deviceIdentity.signPayload(payload),
+                        "signature" to signature,
                         "signedAt" to signedAt,
                         "nonce" to challenge
                     )
@@ -334,15 +388,15 @@ class GatewayRpcOpenClawTransport(
                     put("maxProtocol", 3)
                     put("client", mapOf(
                         "id" to clientId,
+                        "displayName" to config.deviceLabel,
                         "version" to "0.1.0",
-                        "platform" to "Android",
-                        "deviceFamily" to "phone",
-                        "mode" to "control-ui",
+                        "platform" to "android",
+                        "deviceFamily" to "Android",
+                        "mode" to "ui",
                         "instanceId" to instanceId
                     ))
                     put("role", "operator")
-                    put("scopes", listOf("operator.admin", "operator.read", "operator.write", "operator.approvals", "operator.pairing"))
-                    put("caps", listOf("tool-events"))
+                    put("scopes", listOf("operator.read", "operator.write", "operator.talk.secrets"))
                     auth?.let { put("auth", it) }
                     device?.let { put("device", it) }
                     put("userAgent", "OpenClaw Agents Android/0.1.0")
@@ -356,7 +410,7 @@ class GatewayRpcOpenClawTransport(
 
             webSocket = client.newWebSocket(wsRequest, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
-                    Unit
+                    Log.d("OpenClawGateway", "Socket opened url=${config.gatewayUrl} method=$method")
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
@@ -369,6 +423,14 @@ class GatewayRpcOpenClawTransport(
                                 when (event) {
                                     "connect.challenge" -> {
                                         connectNonce = payload?.get("nonce") as? String
+                                        Log.d(
+                                            "OpenClawGateway",
+                                            "Received connect challenge noncePresent=${!connectNonce.isNullOrBlank()} method=$method payloadKeys=${payload?.keys.orEmpty()}"
+                                        )
+                                        Log.d(
+                                            "OpenClawGateway",
+                                            "Sending connect params mode=ui role=operator hasApiKey=${!config.apiKey.isNullOrBlank()} hasDeviceToken=${!deviceToken.isNullOrBlank()} withDevice=${!connectNonce.isNullOrBlank()}"
+                                        )
                                         sendRpc(connectRequestId, "connect", buildConnectParams(connectNonce))
                                     }
                                     "hello" -> extractAndPersistDeviceAuth(payload)
@@ -383,6 +445,10 @@ class GatewayRpcOpenClawTransport(
                                         val details = error?.get("details") as? Map<*, *>
                                         val detailCode = details?.get("code") as? String
                                         val detailText = if (!detailCode.isNullOrBlank()) " [$detailCode]" else ""
+                                        Log.e(
+                                            "OpenClawGateway",
+                                            "connect failed method=$method message=${error?.get("message")} details=$details"
+                                        )
                                         finish(Result.failure(IllegalStateException((error?.get("message") as? String ?: "Gateway connect failed") + detailText)))
                                         return
                                     }
@@ -397,9 +463,17 @@ class GatewayRpcOpenClawTransport(
                                     if (!ok) {
                                         val error = parsed["error"] as? Map<*, *>
                                         val message = error?.get("message") as? String ?: "Gateway RPC failed"
+                                        Log.e(
+                                            "OpenClawGateway",
+                                            "request failed method=$method params=${summarizeParams(params)} error=$error grantedScopes=$grantedScopes"
+                                        )
                                         finish(Result.failure(IllegalStateException("$message (grantedScopes=$grantedScopes)")))
                                         return
                                     }
+                                    Log.d(
+                                        "OpenClawGateway",
+                                        "request ok method=$method params=${summarizeParams(params)}"
+                                    )
                                     @Suppress("UNCHECKED_CAST")
                                     finish(Result.success(parsed["payload"] as? Map<String, Any?> ?: emptyMap()))
                                 }
@@ -440,6 +514,67 @@ class GatewayRpcOpenClawTransport(
             }.joinToString("\n").ifBlank { null }
             else -> null
         }
+    }
+
+    private fun summarizeParams(params: Map<String, Any?>): String {
+        return params.entries.joinToString(
+            prefix = "{",
+            postfix = "}"
+        ) { (key, value) ->
+            val rendered = when (key) {
+                "message" -> "len=${(value as? String)?.length ?: 0}"
+                "sessionKey" -> value.toString()
+                "idempotencyKey" -> "present"
+                else -> value.toString()
+            }
+            "$key=$rendered"
+        }
+    }
+
+    private fun buildDeviceAuthPayloadV3(
+        deviceId: String,
+        clientId: String,
+        clientMode: String,
+        role: String,
+        scopes: List<String>,
+        signedAtMs: Long,
+        token: String?,
+        nonce: String,
+        platform: String?,
+        deviceFamily: String?
+    ): String {
+        return listOf(
+            "v3",
+            deviceId,
+            clientId,
+            clientMode,
+            role,
+            scopes.joinToString(","),
+            signedAtMs.toString(),
+            token.orEmpty(),
+            nonce,
+            normalizeDeviceAuthField(platform),
+            normalizeDeviceAuthField(deviceFamily)
+        ).joinToString("|")
+    }
+
+    private fun normalizeDeviceAuthField(value: String?): String {
+        val trimmed = value?.trim().orEmpty()
+        if (trimmed.isEmpty()) return ""
+        val out = StringBuilder(trimmed.length)
+        for (char in trimmed) {
+            if (char in 'A'..'Z') {
+                out.append((char.code + 32).toChar())
+            } else {
+                out.append(char)
+            }
+        }
+        return out.toString()
+    }
+
+    private fun sha256Hex(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
     }
 
     private fun friendlySessionTitle(sessionKey: String): String {

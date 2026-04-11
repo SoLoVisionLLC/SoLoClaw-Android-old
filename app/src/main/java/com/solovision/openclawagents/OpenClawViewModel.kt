@@ -1,6 +1,7 @@
 package com.solovision.openclawagents
 
 import android.content.Context
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -11,9 +12,12 @@ import com.solovision.openclawagents.data.OpenClawBackendConfig
 import com.solovision.openclawagents.data.OpenClawRepository
 import com.solovision.openclawagents.data.RealOpenClawRepository
 import com.solovision.openclawagents.model.AppUiState
+import com.solovision.openclawagents.model.MessageSenderType
+import com.solovision.openclawagents.model.RoomMessage
 import com.solovision.openclawagents.model.TtsState
 import com.solovision.openclawagents.tts.AndroidTtsEngine
 import com.solovision.openclawagents.tts.TtsEngine
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,6 +27,8 @@ class OpenClawViewModel(
     private val repository: OpenClawRepository = FakeOpenClawRepository(),
     private val ttsEngine: TtsEngine
 ) : ViewModel() {
+
+    private val logTag = "OpenClawViewModel"
 
     private val _uiState = MutableStateFlow(
         AppUiState(
@@ -40,12 +46,18 @@ class OpenClawViewModel(
     }
 
     fun selectRoom(roomId: String) {
-        _uiState.value = _uiState.value.copy(selectedRoomId = roomId)
+        _uiState.value = _uiState.value.copy(
+            selectedRoomId = roomId,
+            errorMessage = null
+        )
         refreshMessages(roomId)
     }
 
     fun updateDraft(text: String) {
-        _uiState.value = _uiState.value.copy(draftMessage = text)
+        _uiState.value = _uiState.value.copy(
+            draftMessage = text,
+            errorMessage = null
+        )
     }
 
     fun toggleCreateRoom(open: Boolean) {
@@ -73,18 +85,36 @@ class OpenClawViewModel(
         if (title.isBlank() || state.selectedAgentIds.isEmpty()) return
 
         viewModelScope.launch {
-            val room = repository.createRoom(title, purpose.ifBlank { "New collaboration room" }, state.selectedAgentIds.toList())
-            val rooms = repository.getRooms()
-            val messages = repository.getRoomMessages(room.id)
-            _uiState.value = state.copy(
-                rooms = rooms,
-                selectedRoomId = room.id,
-                roomMessages = state.roomMessages + (room.id to messages),
-                creatingRoom = false,
-                newRoomTitle = "",
-                newRoomPurpose = "",
-                selectedAgentIds = emptySet()
-            )
+            _uiState.value = _uiState.value.copy(isWorking = true, errorMessage = null)
+            Log.d(logTag, "Creating room title=$title agents=${state.selectedAgentIds.joinToString()}")
+            runCatching {
+                val room = repository.createRoom(
+                    title,
+                    purpose.ifBlank { "New collaboration room" },
+                    state.selectedAgentIds.toList()
+                )
+                val rooms = repository.getRooms()
+                val messages = repository.getRoomMessages(room.id)
+                Triple(room, rooms, messages)
+            }.onSuccess { (room, rooms, messages) ->
+                _uiState.value = _uiState.value.copy(
+                    rooms = rooms,
+                    selectedRoomId = room.id,
+                    roomMessages = _uiState.value.roomMessages + (room.id to messages),
+                    creatingRoom = false,
+                    newRoomTitle = "",
+                    newRoomPurpose = "",
+                    selectedAgentIds = emptySet(),
+                    isWorking = false,
+                    errorMessage = null
+                )
+            }.onFailure { error ->
+                reportFailure("create room", error)
+                _uiState.value = _uiState.value.copy(
+                    isWorking = false,
+                    errorMessage = humanReadableError("Unable to create room", error)
+                )
+            }
         }
     }
 
@@ -95,12 +125,43 @@ class OpenClawViewModel(
         if (text.isBlank()) return
 
         viewModelScope.launch {
-            repository.sendMessage(roomId, text)
-            val updatedMessages = repository.getRoomMessages(roomId)
+            _uiState.value = _uiState.value.copy(isWorking = true, errorMessage = null)
+            Log.d(logTag, "Sending message roomId=$roomId length=${text.length}")
+            val optimisticMessage = RoomMessage(
+                id = "pending-${System.currentTimeMillis()}",
+                senderId = "solo",
+                senderName = "SoLo",
+                senderRole = "Operator",
+                senderType = MessageSenderType.USER,
+                body = text,
+                timestampLabel = "Now"
+            )
             _uiState.value = _uiState.value.copy(
                 draftMessage = "",
-                roomMessages = _uiState.value.roomMessages + (roomId to updatedMessages)
+                roomMessages = _uiState.value.roomMessages + (
+                    roomId to (_uiState.value.roomMessages[roomId].orEmpty() + optimisticMessage)
+                )
             )
+            runCatching {
+                repository.sendMessage(roomId, text)
+                loadMessagesAfterSend(roomId, text, optimisticMessage)
+            }.onSuccess { updatedMessages ->
+                _uiState.value = _uiState.value.copy(
+                    roomMessages = _uiState.value.roomMessages + (roomId to updatedMessages),
+                    isWorking = false,
+                    errorMessage = null
+                )
+            }.onFailure { error ->
+                reportFailure("send message", error)
+                _uiState.value = _uiState.value.copy(
+                    isWorking = false,
+                    draftMessage = text,
+                    roomMessages = _uiState.value.roomMessages + (
+                        roomId to _uiState.value.roomMessages[roomId].orEmpty().filterNot { it.id == optimisticMessage.id }
+                    ),
+                    errorMessage = humanReadableError("Unable to send message", error)
+                )
+            }
         }
     }
 
@@ -128,6 +189,12 @@ class OpenClawViewModel(
                         selectedRoomId = selected
                     )
                     selected?.let(::refreshMessages)
+                }.onFailure { error ->
+                    reportFailure("load rooms", error)
+                    _uiState.value = _uiState.value.copy(
+                        isWorking = false,
+                        errorMessage = humanReadableError("Unable to load rooms", error)
+                    )
                 }
         }
     }
@@ -139,7 +206,44 @@ class OpenClawViewModel(
                     _uiState.value = _uiState.value.copy(
                         roomMessages = _uiState.value.roomMessages + (roomId to messages)
                     )
+                }.onFailure { error ->
+                    reportFailure("load messages for $roomId", error)
+                    _uiState.value = _uiState.value.copy(
+                        isWorking = false,
+                        errorMessage = humanReadableError("Unable to load messages", error)
+                    )
                 }
+        }
+    }
+
+    private fun reportFailure(action: String, error: Throwable) {
+        Log.e(logTag, "Failed to $action", error)
+    }
+
+    private fun humanReadableError(prefix: String, error: Throwable): String {
+        val detail = error.message?.trim().orEmpty()
+        return if (detail.isBlank()) prefix else "$prefix: $detail"
+    }
+
+    private suspend fun loadMessagesAfterSend(
+        roomId: String,
+        expectedUserText: String,
+        optimisticMessage: RoomMessage
+    ): List<RoomMessage> {
+        repeat(4) { attempt ->
+            val messages = repository.getRoomMessages(roomId)
+            if (messages.any { it.senderType == MessageSenderType.USER && it.body == expectedUserText }) {
+                return messages
+            }
+            if (attempt < 3) {
+                delay(500)
+            }
+        }
+        val latest = repository.getRoomMessages(roomId)
+        return if (latest.any { it.id == optimisticMessage.id || (it.senderType == MessageSenderType.USER && it.body == expectedUserText) }) {
+            latest
+        } else {
+            latest + optimisticMessage
         }
     }
 
