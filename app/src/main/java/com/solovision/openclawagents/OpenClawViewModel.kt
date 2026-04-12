@@ -7,14 +7,14 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.solovision.openclawagents.data.AgentVisibilityStore
 import com.solovision.openclawagents.data.AgentVoiceConfigStore
+import com.solovision.openclawagents.data.AppNotificationManager
 import com.solovision.openclawagents.data.AppThemeStore
+import com.solovision.openclawagents.data.buildOpenClawRuntimeDependencies
 import com.solovision.openclawagents.data.ConversationDisplayStore
 import com.solovision.openclawagents.data.FakeOpenClawRepository
-import com.solovision.openclawagents.data.GatewayRpcOpenClawTransport
 import com.solovision.openclawagents.data.MissionControlService
-import com.solovision.openclawagents.data.OpenClawBackendConfig
+import com.solovision.openclawagents.data.NotificationPreferencesStore
 import com.solovision.openclawagents.data.OpenClawRepository
-import com.solovision.openclawagents.data.RealOpenClawRepository
 import com.solovision.openclawagents.data.RoomReadStateStore
 import com.solovision.openclawagents.data.VoiceSettingsStore
 import com.solovision.openclawagents.model.AppUiState
@@ -53,16 +53,24 @@ class OpenClawViewModel(
     private val voiceSettingsStore: VoiceSettingsStore = VoiceSettingsStore(),
     private val appThemeStore: AppThemeStore = AppThemeStore(),
     private val agentVoiceConfigStore: AgentVoiceConfigStore = AgentVoiceConfigStore(),
+    private val notificationPreferencesStore: NotificationPreferencesStore = NotificationPreferencesStore(),
+    private val appNotificationManager: AppNotificationManager? = null,
     private val ttsEngine: TtsEngine
 ) : ViewModel() {
 
     private val logTag = "OpenClawViewModel"
     private var roomPollingJob: Job? = null
+    private var messageNotificationMonitorJob: Job? = null
+    private var cronNotificationMonitorJob: Job? = null
+    private var isAppInForeground: Boolean = true
     private var agentOrderIds = agentVisibilityStore.readAgentOrderIds()
     private val initialVoiceSettings = voiceSettingsStore.read()
     private val initialVoiceProfiles = voiceSettingsStore.readProfiles()
     private val initialAgentVoiceConfigs = agentVoiceConfigStore.read()
     private val initialThemeMode = appThemeStore.read()
+    private val initialNotificationPermissionGranted = appNotificationManager?.hasPermission() ?: true
+    private val initialNotificationSettings =
+        notificationPreferencesStore.readSettings(initialNotificationPermissionGranted)
 
     private val _uiState = MutableStateFlow(
         AppUiState(
@@ -80,7 +88,8 @@ class OpenClawViewModel(
             agentVoiceConfigs = initialAgentVoiceConfigs,
             hiddenAgentIds = agentVisibilityStore.readHiddenAgentIds(),
             showInternalMessages = conversationDisplayStore.readShowInternalMessages(),
-            themeMode = initialThemeMode
+            themeMode = initialThemeMode,
+            notifications = initialNotificationSettings
         )
     )
     val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
@@ -132,6 +141,7 @@ class OpenClawViewModel(
         refreshCronJobs()
         refreshSkills()
         refreshVoiceOptionsIfNeeded(initialVoiceSettings)
+        startNotificationMonitors()
     }
 
     fun openAgentRoom(agentId: String): String {
@@ -183,6 +193,70 @@ class OpenClawViewModel(
     fun stopSelectedRoomPolling() {
         roomPollingJob?.cancel()
         roomPollingJob = null
+    }
+
+    fun setAppInForeground(inForeground: Boolean) {
+        isAppInForeground = inForeground
+        refreshNotificationPermission()
+    }
+
+    fun refreshNotificationPermission() {
+        val permissionGranted = appNotificationManager?.hasPermission() ?: true
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(permissionGranted = permissionGranted)
+        )
+    }
+
+    fun setNotificationsEnabled(enabled: Boolean) {
+        notificationPreferencesStore.writeNotificationsEnabled(enabled)
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(enabled = enabled)
+        )
+    }
+
+    fun setMessageNotificationsEnabled(enabled: Boolean) {
+        notificationPreferencesStore.writeMessageNotificationsEnabled(enabled)
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(messageNotificationsEnabled = enabled)
+        )
+    }
+
+    fun setCronNotificationsEnabled(enabled: Boolean) {
+        notificationPreferencesStore.writeCronNotificationsEnabled(enabled)
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(cronNotificationsEnabled = enabled)
+        )
+    }
+
+    fun setBackgroundSyncEnabled(enabled: Boolean) {
+        notificationPreferencesStore.writeBackgroundSyncEnabled(enabled)
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(backgroundSyncEnabled = enabled)
+        )
+    }
+
+    fun setRoomNotificationsEnabled(roomId: String, enabled: Boolean) {
+        notificationPreferencesStore.writeRoomEnabled(roomId, enabled)
+        val updatedDisabledRoomIds = _uiState.value.notifications.disabledRoomIds.toMutableSet().apply {
+            if (enabled) remove(roomId) else add(roomId)
+        }
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(
+                disabledRoomIds = updatedDisabledRoomIds
+            )
+        )
+    }
+
+    fun setCronJobNotificationsEnabled(jobId: String, enabled: Boolean) {
+        notificationPreferencesStore.writeCronJobEnabled(jobId, enabled)
+        val updatedDisabledCronJobIds = _uiState.value.notifications.disabledCronJobIds.toMutableSet().apply {
+            if (enabled) remove(jobId) else add(jobId)
+        }
+        _uiState.value = _uiState.value.copy(
+            notifications = _uiState.value.notifications.copy(
+                disabledCronJobIds = updatedDisabledCronJobIds
+            )
+        )
     }
 
     fun updateDraft(text: String) {
@@ -1357,6 +1431,72 @@ class OpenClawViewModel(
         }
     }
 
+    private fun startNotificationMonitors() {
+        if (messageNotificationMonitorJob?.isActive != true) {
+            messageNotificationMonitorJob = viewModelScope.launch {
+                delay(6_000)
+                while (isActive) {
+                    runCatching { pollRoomsForNotifications() }
+                        .onFailure { error ->
+                            Log.w(logTag, "Message notification poll failed", error)
+                        }
+                    delay(20_000)
+                }
+            }
+        }
+
+        if (missionControlService != null && cronNotificationMonitorJob?.isActive != true) {
+            cronNotificationMonitorJob = viewModelScope.launch {
+                delay(10_000)
+                while (isActive) {
+                    runCatching { pollCronJobsForNotifications() }
+                        .onFailure { error ->
+                            Log.w(logTag, "Cron notification poll failed", error)
+                        }
+                    delay(30_000)
+                }
+            }
+        }
+    }
+
+    private suspend fun pollRoomsForNotifications() {
+        val rooms = repository.getRooms()
+        val updatedRoomMessages = _uiState.value.roomMessages.toMutableMap()
+        rooms.forEach { room ->
+            val messages = repository.getRoomMessages(room.id)
+            maybeNotifyForNewRoomMessages(room, messages)
+            updatedRoomMessages[room.id] = messages
+        }
+
+        val hiddenAgentIds = _uiState.value.hiddenAgentIds
+        val selectedRoomId = _uiState.value.selectedRoomId
+            ?.takeIf { current -> rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds) }
+            ?: firstVisibleRoomId(rooms, hiddenAgentIds)
+
+        _uiState.value = _uiState.value.copy(
+            rooms = applyUnreadCounts(rooms, updatedRoomMessages),
+            roomMessages = updatedRoomMessages,
+            selectedRoomId = selectedRoomId
+        )
+    }
+
+    private suspend fun pollCronJobsForNotifications() {
+        val service = missionControlService ?: return
+        val jobs = service.listCronJobs()
+        jobs.forEach(::maybeNotifyForCronJob)
+
+        val selectedJobId = _uiState.value.cron.selectedJobId
+            ?.takeIf { selected -> jobs.any { it.id == selected } }
+            ?: jobs.firstOrNull()?.id
+
+        _uiState.value = _uiState.value.copy(
+            cron = _uiState.value.cron.copy(
+                jobs = jobs,
+                selectedJobId = selectedJobId
+            )
+        )
+    }
+
     private fun refreshMessages(roomId: String) {
         viewModelScope.launch {
             runCatching { repository.getRoomMessages(roomId) }
@@ -1377,6 +1517,49 @@ class OpenClawViewModel(
                     )
                 }
         }
+    }
+
+    private fun maybeNotifyForNewRoomMessages(room: CollaborationRoom, messages: List<RoomMessage>) {
+        val notificationEligibleMessages = messages.filter { message ->
+            message.senderType != MessageSenderType.USER && !message.internal
+        }
+        val latestMessageKey = notificationEligibleMessages.lastOrNull()?.messageKey ?: return
+        val lastNotifiedMessageKey = notificationPreferencesStore.readLastNotifiedMessageKey(room.id)
+
+        if (lastNotifiedMessageKey == null) {
+            notificationPreferencesStore.writeLastNotifiedMessageKey(room.id, latestMessageKey)
+            return
+        }
+
+        val lastNotifiedIndex = notificationEligibleMessages.indexOfLast { it.messageKey == lastNotifiedMessageKey }
+        val newMessages = when {
+            lastNotifiedIndex < 0 -> emptyList()
+            lastNotifiedIndex >= notificationEligibleMessages.lastIndex -> emptyList()
+            else -> notificationEligibleMessages.subList(lastNotifiedIndex + 1, notificationEligibleMessages.size)
+        }
+
+        notificationPreferencesStore.writeLastNotifiedMessageKey(room.id, latestMessageKey)
+
+        if (newMessages.isEmpty()) return
+        if (!shouldDeliverMessageNotification(room.id)) return
+        if (isAppInForeground && _uiState.value.selectedRoomId == room.id) return
+
+        appNotificationManager?.notifyNewMessage(room, newMessages.last(), newMessages.size)
+    }
+
+    private fun maybeNotifyForCronJob(job: CronJob) {
+        val signature = cronNotificationSignature(job) ?: return
+        val lastSignature = notificationPreferencesStore.readLastNotifiedCronSignature(job.id)
+        if (lastSignature == null) {
+            notificationPreferencesStore.writeLastNotifiedCronSignature(job.id, signature)
+            return
+        }
+        if (lastSignature == signature) return
+
+        notificationPreferencesStore.writeLastNotifiedCronSignature(job.id, signature)
+        if (!shouldDeliverCronNotification(job.id)) return
+
+        appNotificationManager?.notifyCronUpdate(job)
     }
 
     private fun updateVoiceSettings(
@@ -1573,6 +1756,30 @@ class OpenClawViewModel(
     private fun markRoomRead(roomId: String, messages: List<RoomMessage>) {
         val latestMessageKey = messages.lastOrNull()?.messageKey
         roomReadStateStore.writeLastReadMessageKey(roomId, latestMessageKey)
+        notificationPreferencesStore.writeLastNotifiedMessageKey(roomId, latestMessageKey)
+    }
+
+    private fun shouldDeliverMessageNotification(roomId: String): Boolean {
+        val notifications = _uiState.value.notifications
+        return notifications.permissionGranted &&
+            notifications.enabled &&
+            notifications.messageNotificationsEnabled &&
+            (!notifications.backgroundSyncEnabled || isAppInForeground) &&
+            notifications.isRoomEnabled(roomId)
+    }
+
+    private fun shouldDeliverCronNotification(jobId: String): Boolean {
+        val notifications = _uiState.value.notifications
+        return notifications.permissionGranted &&
+            notifications.enabled &&
+            notifications.cronNotificationsEnabled &&
+            (!notifications.backgroundSyncEnabled || isAppInForeground) &&
+            notifications.isCronJobEnabled(jobId)
+    }
+
+    private fun cronNotificationSignature(job: CronJob): String? {
+        val lastRunAt = job.lastRunAt ?: return null
+        return listOf(lastRunAt, job.lastStatus.orEmpty(), job.lastError.orEmpty()).joinToString("|")
     }
 
     private fun buildLocalMessageKey(
@@ -1659,6 +1866,8 @@ class OpenClawViewModel(
 
     override fun onCleared() {
         roomPollingJob?.cancel()
+        messageNotificationMonitorJob?.cancel()
+        cronNotificationMonitorJob?.cancel()
         ttsEngine.shutdown()
         super.onCleared()
     }
@@ -1666,39 +1875,21 @@ class OpenClawViewModel(
     companion object {
         fun factory(context: Context): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                val (repository, missionControlService) = buildDependencies()
+                val runtime = buildOpenClawRuntimeDependencies(context)
                 @Suppress("UNCHECKED_CAST")
                 return OpenClawViewModel(
-                    repository = repository,
-                    missionControlService = missionControlService,
+                    repository = runtime.repository,
+                    missionControlService = runtime.missionControlService,
                     agentVisibilityStore = AgentVisibilityStore(context),
                     conversationDisplayStore = ConversationDisplayStore(context),
                     roomReadStateStore = RoomReadStateStore(context),
                     voiceSettingsStore = VoiceSettingsStore(context),
                     appThemeStore = AppThemeStore(context),
                     agentVoiceConfigStore = AgentVoiceConfigStore(context),
+                    notificationPreferencesStore = NotificationPreferencesStore(context),
+                    appNotificationManager = AppNotificationManager(context),
                     ttsEngine = ProviderBackedTtsEngine(context)
                 ) as T
-            }
-
-            private fun buildDependencies(): Pair<OpenClawRepository, MissionControlService?> {
-                val gatewayUrl = "wss://gateway.solobot.cloud"
-                val sessionKey = "agent:orion:main"
-                return runCatching {
-                    val transport = GatewayRpcOpenClawTransport(
-                        context = context,
-                        config = OpenClawBackendConfig(
-                            gatewayUrl = gatewayUrl,
-                            sessionKey = sessionKey,
-                            apiKey = "19ca7975c4842989d999110a09569394b203ef14916a4f08187f3e1482197633"
-                        )
-                    )
-                    RealOpenClawRepository(
-                        transport
-                    ) to MissionControlService(transport)
-                }.getOrElse {
-                    FakeOpenClawRepository() to null
-                }
             }
         }
     }

@@ -22,6 +22,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Contrast
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VoiceChat
@@ -32,8 +33,10 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -55,6 +58,13 @@ import com.solovision.openclawagents.ui.theme.getAppTheme
 fun SettingsScreen(
     uiState: AppUiState,
     onBack: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onSetNotificationsEnabled: (Boolean) -> Unit,
+    onSetMessageNotificationsEnabled: (Boolean) -> Unit,
+    onSetCronNotificationsEnabled: (Boolean) -> Unit,
+    onSetBackgroundSyncEnabled: (Boolean) -> Unit,
+    onSetRoomNotificationsEnabled: (String, Boolean) -> Unit,
+    onSetCronJobNotificationsEnabled: (String, Boolean) -> Unit,
     onSetThemeMode: (AppThemeMode) -> Unit,
     onUpdateCartesiaApiKey: (String) -> Unit,
     onUpdateCartesiaModelId: (String) -> Unit,
@@ -92,6 +102,90 @@ fun SettingsScreen(
         ) {
             item {
                 SettingsHeroCard()
+            }
+            item {
+                SettingsCard(
+                    title = "Notifications",
+                    body = "Local Android notifications for new chat replies and cron activity, with per-conversation and per-job control.",
+                    accent = Color(0xFF22C55E),
+                    icon = Icons.Default.Notifications
+                ) {
+                    SettingsInfoRow(
+                        icon = Icons.Default.Notifications,
+                        label = "Android permission",
+                        value = if (uiState.notifications.permissionGranted) "Granted" else "Not granted"
+                    )
+                    if (!uiState.notifications.permissionGranted) {
+                        OutlinedButton(onClick = onRequestNotificationPermission) {
+                            Text("Allow notifications")
+                        }
+                    }
+                    NotificationToggleRow(
+                        label = "Enable all notifications",
+                        description = "Master switch for all local Android alerts.",
+                        checked = uiState.notifications.enabled,
+                        onCheckedChange = onSetNotificationsEnabled
+                    )
+                    NotificationToggleRow(
+                        label = "Message notifications",
+                        description = "New agent and group replies from rooms you leave enabled.",
+                        checked = uiState.notifications.messageNotificationsEnabled,
+                        onCheckedChange = onSetMessageNotificationsEnabled
+                    )
+                    NotificationToggleRow(
+                        label = "Cron notifications",
+                        description = "Cron run updates and failures from jobs you leave enabled.",
+                        checked = uiState.notifications.cronNotificationsEnabled,
+                        onCheckedChange = onSetCronNotificationsEnabled
+                    )
+                    NotificationToggleRow(
+                        label = "Always-on background sync",
+                        description = "Keeps a persistent Android background service alive when you leave the app so message and cron alerts can continue.",
+                        checked = uiState.notifications.backgroundSyncEnabled,
+                        onCheckedChange = onSetBackgroundSyncEnabled
+                    )
+                    NotificationSectionTitle("Conversations")
+                    if (uiState.rooms.isEmpty()) {
+                        Text(
+                            "Conversation toggles will appear here after rooms load.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        uiState.rooms.forEach { room ->
+                            NotificationToggleRow(
+                                label = room.title,
+                                description = listOfNotNull(
+                                    room.sessionLabel,
+                                    if (room.members.size > 1) "Group room" else "Direct room"
+                                ).joinToString(" • "),
+                                checked = uiState.notifications.isRoomEnabled(room.id),
+                                onCheckedChange = { enabled ->
+                                    onSetRoomNotificationsEnabled(room.id, enabled)
+                                }
+                            )
+                        }
+                    }
+                    NotificationSectionTitle("Cron Jobs")
+                    if (uiState.cron.jobs.isEmpty()) {
+                        Text(
+                            "Cron job toggles will appear here after the gateway sync completes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        uiState.cron.jobs.forEach { job ->
+                            NotificationToggleRow(
+                                label = job.name,
+                                description = job.lastStatus ?: cronNotificationLabel(job),
+                                checked = uiState.notifications.isCronJobEnabled(job.id),
+                                onCheckedChange = { enabled ->
+                                    onSetCronJobNotificationsEnabled(job.id, enabled)
+                                }
+                            )
+                        }
+                    }
+                }
             }
             item {
                 SettingsCard(
@@ -447,5 +541,51 @@ private fun SettingsInfoRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+}
+
+@Composable
+private fun NotificationSectionTitle(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+@Composable
+private fun NotificationToggleRow(
+    label: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange
+        )
+    }
+}
+
+private fun cronNotificationLabel(job: com.solovision.openclawagents.model.CronJob): String {
+    return when {
+        !job.lastError.isNullOrBlank() -> "Latest run reported an error"
+        !job.lastRunAt.isNullOrBlank() -> "Last run ${job.lastRunAt}"
+        else -> "No run activity yet"
     }
 }

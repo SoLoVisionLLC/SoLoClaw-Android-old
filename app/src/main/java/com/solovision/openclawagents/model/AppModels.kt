@@ -269,6 +269,19 @@ data class MissionControlCapabilities(
     val supportsSkillHub: Boolean = false
 )
 
+data class NotificationSettingsState(
+    val enabled: Boolean = true,
+    val messageNotificationsEnabled: Boolean = true,
+    val cronNotificationsEnabled: Boolean = true,
+    val backgroundSyncEnabled: Boolean = false,
+    val permissionGranted: Boolean = true,
+    val disabledRoomIds: Set<String> = emptySet(),
+    val disabledCronJobIds: Set<String> = emptySet()
+) {
+    fun isRoomEnabled(roomId: String): Boolean = roomId !in disabledRoomIds
+    fun isCronJobEnabled(jobId: String): Boolean = jobId !in disabledCronJobIds
+}
+
 data class AppUiState(
     val agents: List<Agent> = emptyList(),
     val rooms: List<CollaborationRoom> = emptyList(),
@@ -288,6 +301,7 @@ data class AppUiState(
     val themeMode: AppThemeMode = AppThemeMode.Midnight,
     val cron: CronUiState = CronUiState(),
     val skills: SkillsUiState = SkillsUiState(),
+    val notifications: NotificationSettingsState = NotificationSettingsState(),
     val selectedRoomUnreadAnchorKey: String? = null,
     val isWorking: Boolean = false,
     val errorMessage: String? = null

@@ -1,8 +1,15 @@
 package com.solovision.openclawagents.ui
 
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -13,13 +20,17 @@ import androidx.compose.material3.Text
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navOptions
+import com.solovision.openclawagents.BackgroundSyncService
 import com.solovision.openclawagents.OpenClawViewModel
 import com.solovision.openclawagents.ui.screens.AgentsScreen
 import com.solovision.openclawagents.ui.screens.CronScreen
@@ -34,9 +45,48 @@ fun OpenClawAgentsApp() {
     val navController = rememberNavController()
     val context = LocalContext.current.applicationContext
     val viewModel: OpenClawViewModel = viewModel(factory = OpenClawViewModel.factory(context))
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsState()
+    val latestNotifications by rememberUpdatedState(uiState.notifications)
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        viewModel.refreshNotificationPermission()
+    }
+
+    LaunchedEffect(uiState.notifications.backgroundSyncEnabled, uiState.notifications.enabled) {
+        if (!uiState.notifications.backgroundSyncEnabled || !uiState.notifications.enabled) {
+            context.stopService(BackgroundSyncService.stopIntent(context))
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    viewModel.setAppInForeground(true)
+                    context.stopService(BackgroundSyncService.stopIntent(context))
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    viewModel.setAppInForeground(false)
+                    if (
+                        latestNotifications.enabled &&
+                        latestNotifications.backgroundSyncEnabled &&
+                        latestNotifications.permissionGranted
+                    ) {
+                        ContextCompat.startForegroundService(context, BackgroundSyncService.startIntent(context))
+                    }
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     fun navigateToShellDestination(destination: AppDestination) {
         val options = navOptions {
@@ -226,6 +276,19 @@ fun OpenClawAgentsApp() {
                                 navigateToShellDestination(AppDestination.Dashboard)
                             }
                         },
+                        onRequestNotificationPermission = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                viewModel.refreshNotificationPermission()
+                            }
+                        },
+                        onSetNotificationsEnabled = viewModel::setNotificationsEnabled,
+                        onSetMessageNotificationsEnabled = viewModel::setMessageNotificationsEnabled,
+                        onSetCronNotificationsEnabled = viewModel::setCronNotificationsEnabled,
+                        onSetBackgroundSyncEnabled = viewModel::setBackgroundSyncEnabled,
+                        onSetRoomNotificationsEnabled = viewModel::setRoomNotificationsEnabled,
+                        onSetCronJobNotificationsEnabled = viewModel::setCronJobNotificationsEnabled,
                         onSetThemeMode = viewModel::setThemeMode,
                         onUpdateCartesiaApiKey = viewModel::updateCartesiaApiKey,
                         onUpdateCartesiaModelId = viewModel::updateCartesiaModelId,
