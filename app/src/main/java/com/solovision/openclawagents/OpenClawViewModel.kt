@@ -11,6 +11,7 @@ import com.solovision.openclawagents.data.AppThemeStore
 import com.solovision.openclawagents.data.ConversationDisplayStore
 import com.solovision.openclawagents.data.FakeOpenClawRepository
 import com.solovision.openclawagents.data.GatewayRpcOpenClawTransport
+import com.solovision.openclawagents.data.MissionControlService
 import com.solovision.openclawagents.data.OpenClawBackendConfig
 import com.solovision.openclawagents.data.OpenClawRepository
 import com.solovision.openclawagents.data.RealOpenClawRepository
@@ -20,8 +21,13 @@ import com.solovision.openclawagents.model.AppUiState
 import com.solovision.openclawagents.model.AppThemeMode
 import com.solovision.openclawagents.model.AgentVoiceConfig
 import com.solovision.openclawagents.model.CollaborationRoom
+import com.solovision.openclawagents.model.CronDraft
+import com.solovision.openclawagents.model.CronJob
 import com.solovision.openclawagents.model.MessageSenderType
 import com.solovision.openclawagents.model.RoomMessage
+import com.solovision.openclawagents.model.SkillFileEntry
+import com.solovision.openclawagents.model.SkillHubEntry
+import com.solovision.openclawagents.model.SkillSummary
 import com.solovision.openclawagents.model.TtsState
 import com.solovision.openclawagents.model.VoiceOption
 import com.solovision.openclawagents.model.VoiceProfile
@@ -40,6 +46,7 @@ import kotlinx.coroutines.launch
 
 class OpenClawViewModel(
     private val repository: OpenClawRepository = FakeOpenClawRepository(),
+    private val missionControlService: MissionControlService? = null,
     private val agentVisibilityStore: AgentVisibilityStore = AgentVisibilityStore(),
     private val conversationDisplayStore: ConversationDisplayStore = ConversationDisplayStore(),
     private val roomReadStateStore: RoomReadStateStore = RoomReadStateStore(),
@@ -121,10 +128,13 @@ class OpenClawViewModel(
         )
         refreshAgents()
         refreshRooms()
+        refreshMissionControlCapabilities()
+        refreshCronJobs()
+        refreshSkills()
         refreshVoiceOptionsIfNeeded(initialVoiceSettings)
     }
 
-    fun openAgentRoom(agentId: String) {
+    fun openAgentRoom(agentId: String): String {
         val mainRoomId = "agent:$agentId:main"
         val roomId = _uiState.value.rooms
             .firstOrNull { it.id.equals(mainRoomId, ignoreCase = true) }
@@ -134,6 +144,7 @@ class OpenClawViewModel(
             ?.id
             ?: mainRoomId
         selectRoom(roomId)
+        return roomId
     }
 
     fun selectRoom(roomId: String) {
@@ -365,6 +376,665 @@ class OpenClawViewModel(
                         roomId to _uiState.value.roomMessages[roomId].orEmpty().filterNot { it.id == optimisticMessage.id }
                     ),
                     errorMessage = humanReadableError("Unable to send message", error)
+                )
+            }
+        }
+    }
+
+    fun refreshCronJobs() {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(isLoading = true),
+                errorMessage = null
+            )
+            runCatching {
+                service.listCronJobs()
+            }.onSuccess { jobs ->
+                val selectedJobId = _uiState.value.cron.selectedJobId
+                    ?.takeIf { selected -> jobs.any { it.id == selected } }
+                    ?: jobs.firstOrNull()?.id
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(
+                        jobs = jobs,
+                        selectedJobId = selectedJobId,
+                        isLoading = false
+                    )
+                )
+                selectedJobId?.let(::refreshCronRuns)
+            }.onFailure { error ->
+                reportFailure("load cron jobs", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(isLoading = false),
+                    errorMessage = humanReadableError("Unable to load cron jobs", error)
+                )
+            }
+        }
+    }
+
+    fun refreshMissionControlCapabilities() {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            runCatching {
+                service.detectCapabilities()
+            }.onSuccess { capabilities ->
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(
+                        supportsDelete = capabilities.supportsCronDelete
+                    ),
+                    skills = _uiState.value.skills.copy(
+                        supportsHttpActions = capabilities.supportsSkillHttpActions,
+                        supportsHub = capabilities.supportsSkillHub,
+                        hubResults = if (capabilities.supportsSkillHub) {
+                            _uiState.value.skills.hubResults
+                        } else {
+                            emptyList()
+                        }
+                    )
+                )
+                if (capabilities.supportsSkillHub && _uiState.value.skills.hubResults.isEmpty()) {
+                    browseSkillsHub()
+                }
+            }.onFailure { error ->
+                reportFailure("detect mission control capabilities", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(supportsDelete = false),
+                    skills = _uiState.value.skills.copy(
+                        supportsHttpActions = false,
+                        supportsHub = false,
+                        hubResults = emptyList(),
+                        isLoadingHub = false,
+                        hubActingIdentifier = null
+                    )
+                )
+            }
+        }
+    }
+
+    fun selectCronJob(jobId: String?) {
+        _uiState.value = _uiState.value.copy(
+            cron = _uiState.value.cron.copy(selectedJobId = jobId)
+        )
+        if (jobId != null && !_uiState.value.cron.runsByJobId.containsKey(jobId)) {
+            refreshCronRuns(jobId)
+        }
+    }
+
+    fun refreshCronRuns(jobId: String? = _uiState.value.cron.selectedJobId) {
+        val service = missionControlService ?: return
+        val targetJobId = jobId ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(isLoadingRuns = true),
+                errorMessage = null
+            )
+            runCatching {
+                service.listCronRuns(targetJobId)
+            }.onSuccess { runs ->
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(
+                        runsByJobId = _uiState.value.cron.runsByJobId + (targetJobId to runs),
+                        isLoadingRuns = false
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("load cron runs", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(isLoadingRuns = false),
+                    errorMessage = humanReadableError("Unable to load cron timeline", error)
+                )
+            }
+        }
+    }
+
+    fun createCronJob(draft: CronDraft) {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(actionMessage = "Creating ${draft.name}..."),
+                errorMessage = null
+            )
+            runCatching {
+                service.createCronJob(draft)
+            }.onSuccess {
+                refreshCronJobs()
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = "Created ${draft.name}.")
+                )
+            }.onFailure { error ->
+                reportFailure("create cron job", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = null),
+                    errorMessage = humanReadableError("Unable to create cron job", error)
+                )
+            }
+        }
+    }
+
+    fun updateCronJob(draft: CronDraft) {
+        val service = missionControlService ?: return
+        val jobId = draft.id ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(actionMessage = "Updating ${draft.name}..."),
+                errorMessage = null
+            )
+            runCatching {
+                service.updateCronJob(draft)
+            }.onSuccess {
+                refreshCronJobs()
+                refreshCronRuns(jobId)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = "Updated ${draft.name}.")
+                )
+            }.onFailure { error ->
+                reportFailure("update cron job", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = null),
+                    errorMessage = humanReadableError("Unable to update cron job", error)
+                )
+            }
+        }
+    }
+
+    fun setCronEnabled(job: CronJob, enabled: Boolean) {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(actionMessage = if (enabled) "Enabling ${job.name}..." else "Pausing ${job.name}..."),
+                errorMessage = null
+            )
+            runCatching {
+                service.setCronEnabled(job.id, enabled)
+            }.onSuccess {
+                refreshCronJobs()
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = if (enabled) "${job.name} enabled." else "${job.name} paused.")
+                )
+            }.onFailure { error ->
+                reportFailure("toggle cron job", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = null),
+                    errorMessage = humanReadableError("Unable to update cron job", error)
+                )
+            }
+        }
+    }
+
+    fun runCronJob(job: CronJob) {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(
+                    runningJobId = job.id,
+                    actionMessage = "Triggering ${job.name}..."
+                ),
+                errorMessage = null
+            )
+            runCatching {
+                service.runCronJob(job.id)
+                service.listCronRuns(job.id)
+            }.onSuccess { runs ->
+                refreshCronJobs()
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(
+                        runningJobId = null,
+                        runsByJobId = _uiState.value.cron.runsByJobId + (job.id to runs),
+                        actionMessage = "Triggered ${job.name}."
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("run cron job", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(runningJobId = null, actionMessage = null),
+                    errorMessage = humanReadableError("Unable to run cron job", error)
+                )
+            }
+        }
+    }
+
+    fun deleteCronJob(job: CronJob) {
+        if (!_uiState.value.cron.supportsDelete) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                cron = _uiState.value.cron.copy(actionMessage = "Deleting ${job.name}..."),
+                errorMessage = null
+            )
+            runCatching {
+                service.deleteCronJob(job.id)
+            }.onSuccess {
+                val remainingJobs = _uiState.value.cron.jobs.filterNot { it.id == job.id }
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(
+                        jobs = remainingJobs,
+                        selectedJobId = remainingJobs.firstOrNull()?.id,
+                        runsByJobId = _uiState.value.cron.runsByJobId - job.id,
+                        actionMessage = "Deleted ${job.name}."
+                    )
+                )
+                refreshCronJobs()
+            }.onFailure { error ->
+                reportFailure("delete cron job", error)
+                _uiState.value = _uiState.value.copy(
+                    cron = _uiState.value.cron.copy(actionMessage = null),
+                    errorMessage = humanReadableError("Unable to delete cron job", error)
+                )
+            }
+        }
+    }
+
+    fun clearCronActionMessage() {
+        _uiState.value = _uiState.value.copy(
+            cron = _uiState.value.cron.copy(actionMessage = null)
+        )
+    }
+
+    fun refreshSkills() {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(isLoading = true),
+                errorMessage = null
+            )
+            runCatching {
+                service.listSkills()
+            }.onSuccess { skills ->
+                val selectedSkillKey = _uiState.value.skills.selectedSkillKey
+                    ?.takeIf { selected -> skills.any { it.skillKey.equals(selected, ignoreCase = true) } }
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        skills = skills,
+                        selectedSkillKey = selectedSkillKey,
+                        isLoading = false
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("load skills", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(isLoading = false),
+                    errorMessage = humanReadableError("Unable to load skills", error)
+                )
+            }
+        }
+    }
+
+    fun toggleSkillHidden(skillKey: String) {
+        val next = _uiState.value.skills.hiddenSkillKeys.toMutableSet().apply {
+            if (!add(skillKey)) remove(skillKey)
+        }
+        _uiState.value = _uiState.value.copy(
+            skills = _uiState.value.skills.copy(hiddenSkillKeys = next)
+        )
+    }
+
+    fun selectSkill(skillKey: String?) {
+        _uiState.value = _uiState.value.copy(
+            skills = _uiState.value.skills.copy(
+                selectedSkillKey = skillKey,
+                selectedFilePath = null,
+                selectedFileContent = "",
+                skillFiles = emptyList()
+            )
+        )
+        if (_uiState.value.skills.supportsHttpActions) {
+            skillKey?.let(::loadSkillFiles)
+        }
+    }
+
+    fun loadSkillFiles(skillKey: String? = _uiState.value.skills.selectedSkillKey) {
+        if (!_uiState.value.skills.supportsHttpActions) return
+        val service = missionControlService ?: return
+        val resolvedSkillKey = skillKey ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(
+                    selectedSkillKey = resolvedSkillKey,
+                    isLoadingFiles = true,
+                    selectedFilePath = null,
+                    selectedFileContent = ""
+                ),
+                errorMessage = null
+            )
+            runCatching {
+                service.listSkillFiles(resolvedSkillKey)
+            }.onSuccess { files ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        skillFiles = files.sortedBy { it.relativePath.lowercase() },
+                        isLoadingFiles = false
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("load skill files", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(isLoadingFiles = false),
+                    errorMessage = humanReadableError("Unable to load skill files", error)
+                )
+            }
+        }
+    }
+
+    fun openSkillFile(file: SkillFileEntry) {
+        if (!_uiState.value.skills.supportsHttpActions) return
+        val service = missionControlService ?: return
+        val skillKey = _uiState.value.skills.selectedSkillKey ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(isLoadingFiles = true),
+                errorMessage = null
+            )
+            runCatching {
+                service.readSkillFile(skillKey, file.relativePath)
+            }.onSuccess { content ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        selectedFilePath = file.relativePath,
+                        selectedFileContent = content,
+                        isLoadingFiles = false
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("open skill file", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(isLoadingFiles = false),
+                    errorMessage = humanReadableError("Unable to open skill file", error)
+                )
+            }
+        }
+    }
+
+    fun updateSkillFileContent(content: String) {
+        _uiState.value = _uiState.value.copy(
+            skills = _uiState.value.skills.copy(selectedFileContent = content)
+        )
+    }
+
+    fun saveSelectedSkillFile() {
+        if (!_uiState.value.skills.supportsHttpActions) return
+        val service = missionControlService ?: return
+        val skillKey = _uiState.value.skills.selectedSkillKey ?: return
+        val relativePath = _uiState.value.skills.selectedFilePath ?: return
+        val content = _uiState.value.skills.selectedFileContent
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(isSavingFile = true),
+                errorMessage = null
+            )
+            runCatching {
+                service.saveSkillFile(skillKey, relativePath, content)
+            }.onSuccess {
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        isSavingFile = false,
+                        actionLog = "Saved $relativePath"
+                    )
+                )
+                loadSkillFiles(skillKey)
+            }.onFailure { error ->
+                reportFailure("save skill file", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(isSavingFile = false),
+                    errorMessage = humanReadableError("Unable to save skill file", error)
+                )
+            }
+        }
+    }
+
+    fun installSkill(skill: SkillSummary, installId: String) {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(actingSkillKey = skill.skillKey),
+                errorMessage = null
+            )
+            runCatching {
+                service.installSkill(skill.name, installId)
+            }.onSuccess { log ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        actingSkillKey = null,
+                        actionLog = log
+                    )
+                )
+                refreshSkills()
+            }.onFailure { error ->
+                reportFailure("install skill", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(actingSkillKey = null),
+                    errorMessage = humanReadableError("Unable to install skill", error)
+                )
+            }
+        }
+    }
+
+    fun setSkillEnabled(skill: SkillSummary, enabled: Boolean) {
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(actingSkillKey = skill.skillKey),
+                errorMessage = null
+            )
+            runCatching {
+                service.setSkillEnabled(skill.skillKey, enabled)
+            }.onSuccess {
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        actingSkillKey = null,
+                        actionLog = if (enabled) "Enabled ${skill.name}" else "Disabled ${skill.name}"
+                    )
+                )
+                refreshSkills()
+            }.onFailure { error ->
+                reportFailure("update skill", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(actingSkillKey = null),
+                    errorMessage = humanReadableError("Unable to update skill", error)
+                )
+            }
+        }
+    }
+
+    fun uninstallSkill(skill: SkillSummary) {
+        if (!_uiState.value.skills.supportsHttpActions) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(actingSkillKey = skill.skillKey),
+                errorMessage = null
+            )
+            runCatching {
+                service.uninstallSkill(skill.skillKey)
+            }.onSuccess {
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        actingSkillKey = null,
+                        actionLog = "Uninstalled ${skill.name}"
+                    )
+                )
+                refreshSkills()
+            }.onFailure { error ->
+                reportFailure("uninstall skill", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(actingSkillKey = null),
+                    errorMessage = humanReadableError("Unable to uninstall skill", error)
+                )
+            }
+        }
+    }
+
+    fun checkSkill(skill: SkillSummary) {
+        if (!_uiState.value.skills.supportsHttpActions) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(actingSkillKey = skill.skillKey),
+                errorMessage = null
+            )
+            runCatching {
+                service.checkSkill(skill.name)
+            }.onSuccess { log ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        actingSkillKey = null,
+                        actionLog = log
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("check skill", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(actingSkillKey = null),
+                    errorMessage = humanReadableError("Unable to check skill", error)
+                )
+            }
+        }
+    }
+
+    fun updateSkillFromSource(skill: SkillSummary) {
+        if (!_uiState.value.skills.supportsHttpActions) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(actingSkillKey = skill.skillKey),
+                errorMessage = null
+            )
+            runCatching {
+                service.updateSkill(skill.name)
+            }.onSuccess { log ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        actingSkillKey = null,
+                        actionLog = log
+                    )
+                )
+                refreshSkills()
+            }.onFailure { error ->
+                reportFailure("update skill from source", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(actingSkillKey = null),
+                    errorMessage = humanReadableError("Unable to update skill", error)
+                )
+            }
+        }
+    }
+
+    fun browseSkillsHub() {
+        if (!_uiState.value.skills.supportsHub) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(
+                    isLoadingHub = true,
+                    lastHubQuery = ""
+                ),
+                errorMessage = null
+            )
+            runCatching {
+                service.browseSkillsHub()
+            }.onSuccess { results ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        isLoadingHub = false,
+                        hubResults = results,
+                        lastHubQuery = ""
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("browse skills hub", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(isLoadingHub = false),
+                    errorMessage = humanReadableError("Unable to browse skills hub", error)
+                )
+            }
+        }
+    }
+
+    fun searchSkillsHub(query: String) {
+        if (!_uiState.value.skills.supportsHub) return
+        val service = missionControlService ?: return
+        val trimmedQuery = query.trim()
+        if (trimmedQuery.isBlank()) {
+            browseSkillsHub()
+            return
+        }
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(
+                    isLoadingHub = true,
+                    lastHubQuery = trimmedQuery
+                ),
+                errorMessage = null
+            )
+            runCatching {
+                service.searchSkillsHub(trimmedQuery)
+            }.onSuccess { results ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        isLoadingHub = false,
+                        hubResults = results,
+                        lastHubQuery = trimmedQuery
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("search skills hub", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(isLoadingHub = false),
+                    errorMessage = humanReadableError("Unable to search skills hub", error)
+                )
+            }
+        }
+    }
+
+    fun inspectHubSkill(entry: SkillHubEntry) {
+        if (!_uiState.value.skills.supportsHub) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(hubActingIdentifier = entry.identifier),
+                errorMessage = null
+            )
+            runCatching {
+                service.inspectSkillHub(entry.identifier)
+            }.onSuccess { log ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        hubActingIdentifier = null,
+                        actionLog = log
+                    )
+                )
+            }.onFailure { error ->
+                reportFailure("inspect hub skill", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(hubActingIdentifier = null),
+                    errorMessage = humanReadableError("Unable to inspect hub skill", error)
+                )
+            }
+        }
+    }
+
+    fun installHubSkill(entry: SkillHubEntry) {
+        if (!_uiState.value.skills.supportsHub) return
+        val service = missionControlService ?: return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                skills = _uiState.value.skills.copy(hubActingIdentifier = entry.identifier),
+                errorMessage = null
+            )
+            runCatching {
+                service.installSkillHub(entry.identifier)
+            }.onSuccess { log ->
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(
+                        hubActingIdentifier = null,
+                        actionLog = log
+                    )
+                )
+                refreshSkills()
+            }.onFailure { error ->
+                reportFailure("install hub skill", error)
+                _uiState.value = _uiState.value.copy(
+                    skills = _uiState.value.skills.copy(hubActingIdentifier = null),
+                    errorMessage = humanReadableError("Unable to install hub skill", error)
                 )
             }
         }
@@ -996,10 +1666,11 @@ class OpenClawViewModel(
     companion object {
         fun factory(context: Context): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                val repository = buildRepository()
+                val (repository, missionControlService) = buildDependencies()
                 @Suppress("UNCHECKED_CAST")
                 return OpenClawViewModel(
                     repository = repository,
+                    missionControlService = missionControlService,
                     agentVisibilityStore = AgentVisibilityStore(context),
                     conversationDisplayStore = ConversationDisplayStore(context),
                     roomReadStateStore = RoomReadStateStore(context),
@@ -1010,22 +1681,23 @@ class OpenClawViewModel(
                 ) as T
             }
 
-            private fun buildRepository(): OpenClawRepository {
+            private fun buildDependencies(): Pair<OpenClawRepository, MissionControlService?> {
                 val gatewayUrl = "wss://gateway.solobot.cloud"
                 val sessionKey = "agent:orion:main"
                 return runCatching {
-                    RealOpenClawRepository(
-                        GatewayRpcOpenClawTransport(
-                            context = context,
-                            config = OpenClawBackendConfig(
-                                gatewayUrl = gatewayUrl,
-                                sessionKey = sessionKey,
-                                apiKey = "19ca7975c4842989d999110a09569394b203ef14916a4f08187f3e1482197633"
-                            )
+                    val transport = GatewayRpcOpenClawTransport(
+                        context = context,
+                        config = OpenClawBackendConfig(
+                            gatewayUrl = gatewayUrl,
+                            sessionKey = sessionKey,
+                            apiKey = "19ca7975c4842989d999110a09569394b203ef14916a4f08187f3e1482197633"
                         )
                     )
+                    RealOpenClawRepository(
+                        transport
+                    ) to MissionControlService(transport)
                 }.getOrElse {
-                    FakeOpenClawRepository()
+                    FakeOpenClawRepository() to null
                 }
             }
         }

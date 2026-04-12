@@ -138,7 +138,7 @@ fun RoomScreen(
 
     if (confirmDeleteSession && room != null) {
         DeleteSessionDialog(
-            sessionLabel = room.sessionLabel ?: "Session",
+            sessionLabel = displaySessionLabel(room.sessionLabel),
             onDismiss = { confirmDeleteSession = false },
             onConfirmDelete = {
                 confirmDeleteSession = false
@@ -238,7 +238,7 @@ fun RoomScreen(
                     if (room != null && directSessions.isNotEmpty()) {
                         Box {
                             TextButton(onClick = { sessionsExpanded = true }) {
-                                Text(room.sessionLabel ?: "Main")
+                                Text(displaySessionLabel(room.sessionLabel))
                                 Icon(
                                     imageVector = Icons.Default.ArrowDropDown,
                                     contentDescription = "Change session"
@@ -252,7 +252,7 @@ fun RoomScreen(
                                     DropdownMenuItem(
                                         text = {
                                             Column {
-                                                Text(session.sessionLabel ?: "Main")
+                                                Text(displaySessionLabel(session.sessionLabel))
                                                 Text(
                                                     session.lastActivity,
                                                     style = MaterialTheme.typography.labelSmall,
@@ -377,10 +377,18 @@ private fun isDeletableDirectSessionKey(roomId: String): Boolean {
 private fun roomSubtitle(room: CollaborationRoom?, directSessions: List<CollaborationRoom>): String {
     if (room == null) return "No room selected"
     return when {
-        room.id.startsWith("agent:") && directSessions.size > 1 -> "Session: ${room.sessionLabel ?: "Main"}"
+        room.id.startsWith("agent:") && directSessions.size > 1 -> "Session: ${displaySessionLabel(room.sessionLabel)}"
         room.id.startsWith("agent:") -> room.purpose
         room.members.isNotEmpty() -> room.members.joinToString(" | ")
         else -> room.purpose
+    }
+}
+
+private fun displaySessionLabel(sessionLabel: String?): String {
+    return when {
+        sessionLabel.isNullOrBlank() -> "Halo"
+        sessionLabel.equals("main", ignoreCase = true) -> "Halo"
+        else -> sessionLabel
     }
 }
 

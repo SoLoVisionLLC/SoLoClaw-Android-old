@@ -22,10 +22,11 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navOptions
 import com.solovision.openclawagents.OpenClawViewModel
 import com.solovision.openclawagents.ui.screens.AgentsScreen
+import com.solovision.openclawagents.ui.screens.CronScreen
 import com.solovision.openclawagents.ui.screens.DashboardScreen
-import com.solovision.openclawagents.ui.screens.FeaturePlaceholderScreen
 import com.solovision.openclawagents.ui.screens.RoomScreen
 import com.solovision.openclawagents.ui.screens.SettingsScreen
+import com.solovision.openclawagents.ui.screens.SkillsScreen
 import com.solovision.openclawagents.ui.theme.OpenClawAgentsTheme
 
 @Composable
@@ -113,8 +114,8 @@ fun OpenClawAgentsApp() {
                         },
                         onDeleteRoom = viewModel::deleteRoom,
                         onOpenAgent = { agentId ->
-                            viewModel.openAgentRoom(agentId)
-                            openChat()
+                            val roomId = viewModel.openAgentRoom(agentId)
+                            openChat(roomId)
                         },
                         onOpenRoom = { roomId -> openChat(roomId) },
                         onOpenSettings = { navigateToShellDestination(AppDestination.Settings) }
@@ -124,8 +125,8 @@ fun OpenClawAgentsApp() {
                     AgentsScreen(
                         uiState = uiState,
                         onOpenAgent = { agentId ->
-                            viewModel.openAgentRoom(agentId)
-                            openChat()
+                            val roomId = viewModel.openAgentRoom(agentId)
+                            openChat(roomId)
                         },
                         onOpenDashboard = { navigateToShellDestination(AppDestination.Dashboard) },
                         onManageAgents = { viewModel.toggleManageAgents(true) },
@@ -177,17 +178,44 @@ fun OpenClawAgentsApp() {
                     )
                 }
                 composable(AppDestination.Cron.route) {
-                    FeaturePlaceholderScreen(
-                        title = "Cron Jobs",
-                        summary = "This bottom-nav destination matches the Hermes mission-control shell.",
-                        detail = "The Android shell is ready for a cron-jobs screen, but the current Android data layer does not yet expose the Hermes cron endpoints. Chat stays untouched while we add parity safely."
+                    CronScreen(
+                        uiState = uiState,
+                        onRefresh = {
+                            viewModel.refreshMissionControlCapabilities()
+                            viewModel.refreshCronJobs()
+                        },
+                        onSelectJob = viewModel::selectCronJob,
+                        onRefreshRuns = viewModel::refreshCronRuns,
+                        onToggleEnabled = viewModel::setCronEnabled,
+                        onRunJob = viewModel::runCronJob,
+                        onDeleteJob = viewModel::deleteCronJob,
+                        onCreateJob = viewModel::createCronJob,
+                        onUpdateJob = viewModel::updateCronJob,
+                        onClearActionMessage = viewModel::clearCronActionMessage
                     )
                 }
                 composable(AppDestination.Skills.route) {
-                    FeaturePlaceholderScreen(
-                        title = "Skills",
-                        summary = "Skills now have a first-class navigation slot in the Android mission-control shell.",
-                        detail = "The screen is intentionally a placeholder until the Android app can talk to the same skills APIs that power Hermes. This keeps navigation parity moving without inventing unsupported behavior."
+                    SkillsScreen(
+                        uiState = uiState,
+                        onRefresh = {
+                            viewModel.refreshMissionControlCapabilities()
+                            viewModel.refreshSkills()
+                        },
+                        onSelectSkill = viewModel::selectSkill,
+                        onToggleHidden = viewModel::toggleSkillHidden,
+                        onLoadSkillFiles = viewModel::loadSkillFiles,
+                        onOpenSkillFile = viewModel::openSkillFile,
+                        onUpdateSkillFileContent = viewModel::updateSkillFileContent,
+                        onSaveSelectedSkillFile = viewModel::saveSelectedSkillFile,
+                        onInstallSkill = viewModel::installSkill,
+                        onSetSkillEnabled = viewModel::setSkillEnabled,
+                        onUninstallSkill = viewModel::uninstallSkill,
+                        onCheckSkill = viewModel::checkSkill,
+                        onUpdateSkillFromSource = viewModel::updateSkillFromSource,
+                        onBrowseSkillsHub = viewModel::browseSkillsHub,
+                        onSearchSkillsHub = viewModel::searchSkillsHub,
+                        onInspectHubSkill = viewModel::inspectHubSkill,
+                        onInstallHubSkill = viewModel::installHubSkill
                     )
                 }
                 composable(AppDestination.Settings.route) {

@@ -10,8 +10,10 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -148,6 +150,10 @@ class GatewayRpcOpenClawTransport(
     okHttpClient: OkHttpClient? = null
 ) : OpenClawTransport {
 
+    private companion object {
+        const val PRIMARY_SESSION_LABEL = "Halo"
+    }
+
     private val deviceAuthStore = OpenClawDeviceAuthStore(context)
     private val deviceIdentity = OpenClawDeviceIdentity(deviceAuthStore)
     private val localRoomStore = LocalRoomStore(context)
@@ -243,7 +249,7 @@ class GatewayRpcOpenClawTransport(
                         unreadCount = 0,
                         active = mainSessionKey == config.sessionKey,
                         lastActivity = if (agentSessions.isEmpty()) "Live" else "Available",
-                        sessionLabel = "Main"
+                        sessionLabel = PRIMARY_SESSION_LABEL
                     )
                     if (agentSessions.isEmpty()) {
                         listOf(mainRoom)
@@ -487,6 +493,51 @@ class GatewayRpcOpenClawTransport(
         Log.d("OpenClawGateway", "Deleting remote session key=$roomId")
         deleteGatewaySession(roomId)
         Log.d("OpenClawGateway", "Deleted remote session key=$roomId")
+    }
+
+    suspend fun requestGatewayMethod(
+        method: String,
+        params: Map<String, Any?> = emptyMap()
+    ): Map<String, Any?> = request(method, params)
+
+    suspend fun requestHttpJson(
+        path: String,
+        method: String = "GET",
+        body: String? = null
+    ): String = withContext(dispatcher) {
+        val requestBuilder = Request.Builder()
+            .url("${apiBaseUrl()}${path.ensureLeadingSlash()}")
+            .header("Content-Type", "application/json")
+
+        config.apiKey?.trim()?.takeIf { it.isNotEmpty() }?.let { apiKey ->
+            requestBuilder.header("Authorization", "Bearer $apiKey")
+            requestBuilder.header("X-API-Key", apiKey)
+        }
+
+        val jsonType = "application/json; charset=utf-8".toMediaType()
+        val request = when (method.uppercase()) {
+            "POST" -> requestBuilder.post((body ?: "").toRequestBody(jsonType)).build()
+            "PUT" -> requestBuilder.put((body ?: "").toRequestBody(jsonType)).build()
+            "PATCH" -> requestBuilder.patch((body ?: "").toRequestBody(jsonType)).build()
+            "DELETE" -> if (body == null) requestBuilder.delete().build()
+                else requestBuilder.delete(body.toRequestBody(jsonType)).build()
+            else -> requestBuilder.get().build()
+        }
+
+        client.newCall(request).execute().use { response ->
+            val payload = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                error("HTTP ${response.code}: ${payload.ifBlank { response.message }}")
+            }
+            payload
+        }
+    }
+
+    fun apiBaseUrl(): String {
+        return config.gatewayUrl
+            .replaceFirst("wss://", "https://")
+            .replaceFirst("ws://", "http://")
+            .trimEnd('/')
     }
 
     private suspend fun fetchRemoteRoomMessages(roomId: String): List<RoomMessage> {
@@ -1090,7 +1141,7 @@ class GatewayRpcOpenClawTransport(
 
     private fun friendlySessionTitle(sessionKey: String): String {
         val agent = agentIdFromSessionKey(sessionKey)
-        return agent.replaceFirstChar { it.uppercase() }
+        return displayAgentName(agent)
     }
 
     private suspend fun resolveLocalRoomTargets(
@@ -1190,8 +1241,7 @@ class GatewayRpcOpenClawTransport(
 
     private fun resolveRoomAgentDisplayName(roomId: String, agentId: String): String {
         return localRoomMemberNames[roomId]?.get(agentId)
-            ?: cachedAgents.firstOrNull { it.id.equals(agentId, ignoreCase = true) }?.name
-            ?: prettifyId(agentId)
+            ?: displayAgentName(agentId)
     }
 
     private fun agentMainSessionKey(agentId: String): String = "agent:$agentId:main"
@@ -1254,13 +1304,18 @@ class GatewayRpcOpenClawTransport(
 
     private fun sessionLabelForKey(key: String): String {
         val parts = key.split(':')
-        if (parts.size < 3) return "Main"
+        if (parts.size < 3) return PRIMARY_SESSION_LABEL
         val tail = parts.drop(2)
         return when {
-            tail.firstOrNull().equals("main", ignoreCase = true) -> "Main"
+            tail.firstOrNull().equals("main", ignoreCase = true) -> PRIMARY_SESSION_LABEL
             tail.firstOrNull().equals("room", ignoreCase = true) -> tail.drop(1).joinToString(":").ifBlank { "Room Session" }
             else -> tail.joinToString(":").ifBlank { "Session" }
         }.replace('-', ' ').replaceFirstChar { it.uppercase() }
+    }
+
+    private fun displayAgentName(agentId: String): String {
+        return cachedAgents.firstOrNull { it.id.equals(agentId, ignoreCase = true) }?.name
+            ?: if (agentId.equals("main", ignoreCase = true)) PRIMARY_SESSION_LABEL else prettifyId(agentId)
     }
 
     private fun agentIdFromSessionKey(sessionKey: String): String {
@@ -1460,6 +1515,8 @@ private fun escapeJson(value: String): String {
         .replace("\r", "\\r")
         .replace("\t", "\\t")
 }
+
+private fun String.ensureLeadingSlash(): String = if (startsWith('/')) this else "/$this"
 
 private fun buildMessageKey(role: String, senderId: String, body: String, timestampMs: Long): String {
     val normalized = listOf(role.trim().lowercase(), senderId.trim().lowercase(), timestampMs.toString(), body.trim())
