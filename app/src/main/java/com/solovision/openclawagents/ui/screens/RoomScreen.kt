@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
@@ -324,6 +325,15 @@ fun RoomScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            room?.let { activeRoom ->
+                item {
+                    RoomOverviewCard(
+                        room = activeRoom,
+                        visibleMessageCount = visibleMessages.size,
+                        showingInternalMessages = uiState.showInternalMessages
+                    )
+                }
+            }
             if (uiState.isWorking || uiState.errorMessage != null) {
                 item {
                     StatusBanner(
@@ -788,7 +798,7 @@ private fun MessageBubble(
     onPlayMessage: () -> Unit
 ) {
     val bubbleColor = when (message.senderType) {
-        MessageSenderType.USER -> MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+        MessageSenderType.USER -> MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
         MessageSenderType.AGENT -> MaterialTheme.colorScheme.surface
         MessageSenderType.SYSTEM -> MaterialTheme.colorScheme.surfaceVariant
     }
@@ -818,6 +828,7 @@ private fun MessageBubble(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    SpeakerChip(message.senderType)
                     if (message.spoken) {
                         Icon(
                             imageVector = Icons.Default.GraphicEq,
@@ -869,37 +880,50 @@ private fun ComposerBar(
         shape = RoundedCornerShape(28.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
-        Row(
+        Column(
             modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier.weight(1f),
-                placeholder = {
-                    Text(
-                        if (roomTitle.isNullOrBlank()) {
-                            "Send a message"
-                        } else {
-                            "Message $roomTitle"
-                        }
-                    )
+            Text(
+                text = if (roomTitle.isNullOrBlank()) {
+                    "Mission channel"
+                } else {
+                    "Live in $roomTitle"
                 },
-                shape = RoundedCornerShape(18.dp)
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Box(
-                modifier = Modifier
-                    .background(Color(0xFF7C5CFF), RoundedCornerShape(18.dp))
-                    .padding(4.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                IconButton(onClick = onSend) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send",
-                        tint = Color.White
-                    )
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = {
+                        Text(
+                            if (roomTitle.isNullOrBlank()) {
+                                "Send a message"
+                            } else {
+                                "Message $roomTitle"
+                            }
+                        )
+                    },
+                    shape = RoundedCornerShape(18.dp)
+                )
+                Box(
+                    modifier = Modifier
+                        .background(Color(0xFF7C5CFF), RoundedCornerShape(18.dp))
+                        .padding(4.dp)
+                ) {
+                    IconButton(onClick = onSend) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Send",
+                            tint = Color.White
+                        )
+                    }
                 }
             }
         }
@@ -934,6 +958,72 @@ private fun StatusBanner(message: String, isError: Boolean) {
             modifier = Modifier.padding(16.dp),
             style = MaterialTheme.typography.bodyMedium,
             color = if (isError) Color(0xFFFFD7DE) else MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+@Composable
+private fun RoomOverviewCard(
+    room: CollaborationRoom,
+    visibleMessageCount: Int,
+    showingInternalMessages: Boolean
+) {
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(room.title, style = MaterialTheme.typography.titleLarge)
+            Text(
+                room.purpose,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                VoiceActionChip(
+                    icon = Icons.Default.Campaign,
+                    label = "${room.members.size} agents"
+                )
+                VoiceActionChip(
+                    icon = Icons.Default.PlayArrow,
+                    label = "$visibleMessageCount visible"
+                )
+                VoiceActionChip(
+                    icon = if (showingInternalMessages) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                    label = if (showingInternalMessages) "Details on" else "Details off"
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SpeakerChip(senderType: MessageSenderType) {
+    val label = when (senderType) {
+        MessageSenderType.USER -> "Operator"
+        MessageSenderType.AGENT -> "Agent"
+        MessageSenderType.SYSTEM -> "System"
+    }
+    val tone = when (senderType) {
+        MessageSenderType.USER -> MaterialTheme.colorScheme.primary
+        MessageSenderType.AGENT -> MaterialTheme.colorScheme.secondary
+        MessageSenderType.SYSTEM -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Card(
+        shape = RoundedCornerShape(999.dp),
+        colors = CardDefaults.cardColors(containerColor = tone.copy(alpha = 0.16f))
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = tone
         )
     }
 }

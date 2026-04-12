@@ -41,6 +41,24 @@ enum class VoiceProvider {
     Lemonfox
 }
 
+enum class AppThemeMode {
+    Midnight,
+    Obsidian,
+    Nord,
+    Dracula,
+    TokyoNight,
+    Monokai,
+    Catppuccin,
+    Snow,
+    Latte,
+    RosePine,
+    Solarized,
+    Paper,
+    SoLoVision,
+    Cyberpunk,
+    Ocean
+}
+
 data class VoiceOption(
     val id: String,
     val label: String
@@ -120,6 +138,7 @@ data class AppUiState(
     val selectedAgentIds: Set<String> = emptySet(),
     val hiddenAgentIds: Set<String> = emptySet(),
     val showInternalMessages: Boolean = true,
+    val themeMode: AppThemeMode = AppThemeMode.Midnight,
     val selectedRoomUnreadAnchorKey: String? = null,
     val isWorking: Boolean = false,
     val errorMessage: String? = null

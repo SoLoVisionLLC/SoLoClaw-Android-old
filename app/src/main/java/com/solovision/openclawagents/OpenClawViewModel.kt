@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.solovision.openclawagents.data.AgentVisibilityStore
 import com.solovision.openclawagents.data.AgentVoiceConfigStore
+import com.solovision.openclawagents.data.AppThemeStore
 import com.solovision.openclawagents.data.ConversationDisplayStore
 import com.solovision.openclawagents.data.FakeOpenClawRepository
 import com.solovision.openclawagents.data.GatewayRpcOpenClawTransport
@@ -16,6 +17,7 @@ import com.solovision.openclawagents.data.RealOpenClawRepository
 import com.solovision.openclawagents.data.RoomReadStateStore
 import com.solovision.openclawagents.data.VoiceSettingsStore
 import com.solovision.openclawagents.model.AppUiState
+import com.solovision.openclawagents.model.AppThemeMode
 import com.solovision.openclawagents.model.AgentVoiceConfig
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
@@ -42,6 +44,7 @@ class OpenClawViewModel(
     private val conversationDisplayStore: ConversationDisplayStore = ConversationDisplayStore(),
     private val roomReadStateStore: RoomReadStateStore = RoomReadStateStore(),
     private val voiceSettingsStore: VoiceSettingsStore = VoiceSettingsStore(),
+    private val appThemeStore: AppThemeStore = AppThemeStore(),
     private val agentVoiceConfigStore: AgentVoiceConfigStore = AgentVoiceConfigStore(),
     private val ttsEngine: TtsEngine
 ) : ViewModel() {
@@ -52,6 +55,7 @@ class OpenClawViewModel(
     private val initialVoiceSettings = voiceSettingsStore.read()
     private val initialVoiceProfiles = voiceSettingsStore.readProfiles()
     private val initialAgentVoiceConfigs = agentVoiceConfigStore.read()
+    private val initialThemeMode = appThemeStore.read()
 
     private val _uiState = MutableStateFlow(
         AppUiState(
@@ -68,7 +72,8 @@ class OpenClawViewModel(
             ),
             agentVoiceConfigs = initialAgentVoiceConfigs,
             hiddenAgentIds = agentVisibilityStore.readHiddenAgentIds(),
-            showInternalMessages = conversationDisplayStore.readShowInternalMessages()
+            showInternalMessages = conversationDisplayStore.readShowInternalMessages(),
+            themeMode = initialThemeMode
         )
     )
     val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
@@ -369,6 +374,11 @@ class OpenClawViewModel(
         _uiState.value = _uiState.value.copy(
             ttsState = _uiState.value.ttsState.copy(settingsExpanded = open)
         )
+    }
+
+    fun setThemeMode(mode: AppThemeMode) {
+        appThemeStore.write(mode)
+        _uiState.value = _uiState.value.copy(themeMode = mode)
     }
 
     fun setVoiceProvider(provider: VoiceProvider) {
@@ -994,6 +1004,7 @@ class OpenClawViewModel(
                     conversationDisplayStore = ConversationDisplayStore(context),
                     roomReadStateStore = RoomReadStateStore(context),
                     voiceSettingsStore = VoiceSettingsStore(context),
+                    appThemeStore = AppThemeStore(context),
                     agentVoiceConfigStore = AgentVoiceConfigStore(context),
                     ttsEngine = ProviderBackedTtsEngine(context)
                 ) as T

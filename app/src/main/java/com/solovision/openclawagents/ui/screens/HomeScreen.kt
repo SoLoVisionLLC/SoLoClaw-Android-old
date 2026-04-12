@@ -219,7 +219,7 @@ fun HomeScreenContent(
 }
 
 @Composable
-private fun ReorderableAgentList(
+internal fun ReorderableAgentList(
     agents: List<Agent>,
     voiceConfigs: Map<String, AgentVoiceConfig>,
     onMoveAgent: (String, String) -> Unit,
@@ -288,7 +288,7 @@ private fun ReorderableAgentList(
 }
 
 @Composable
-private fun CreateRoomDialog(
+internal fun CreateRoomDialog(
     uiState: AppUiState,
     onDismiss: () -> Unit,
     onUpdateRoomTitle: (String) -> Unit,
@@ -380,7 +380,7 @@ private fun CreateRoomDialog(
 }
 
 @Composable
-private fun ManageAgentsDialog(
+internal fun ManageAgentsDialog(
     uiState: AppUiState,
     onDismiss: () -> Unit,
     onSetAgentHidden: (String, Boolean) -> Unit
@@ -597,7 +597,7 @@ private data class ItemBounds(
 }
 
 @Composable
-private fun AgentVoiceConfigDialog(
+internal fun AgentVoiceConfigDialog(
     agent: Agent,
     config: AgentVoiceConfig,
     availableVoices: List<VoiceOption>,
@@ -684,7 +684,7 @@ private fun AgentVoiceConfigDialog(
 }
 
 @Composable
-private fun RoomCard(
+internal fun RoomCard(
     room: CollaborationRoom,
     onOpenRoom: () -> Unit,
     onDeleteRoom: (() -> Unit)?
@@ -734,7 +734,7 @@ private fun RoomCard(
 }
 
 @Composable
-private fun DeleteRoomDialog(
+internal fun DeleteRoomDialog(
     room: CollaborationRoom,
     onDismiss: () -> Unit,
     onConfirmDelete: () -> Unit
