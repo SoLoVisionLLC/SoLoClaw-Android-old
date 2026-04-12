@@ -2,6 +2,7 @@ package com.solovision.openclawagents.data
 
 import android.content.Context
 import android.util.Log
+import com.solovision.openclawagents.model.Agent
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
 import com.solovision.openclawagents.model.RoomMessage
@@ -22,11 +23,20 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
+private val REQUESTED_OPERATOR_SCOPES = listOf(
+    "operator.read",
+    "operator.write",
+    "operator.talk.secrets",
+    "operator.admin"
+)
+
 interface OpenClawRepository {
+    suspend fun getAgents(): List<Agent>
     suspend fun getRooms(): List<CollaborationRoom>
     suspend fun getRoomMessages(roomId: String): List<RoomMessage>
     suspend fun sendMessage(roomId: String, text: String)
     suspend fun createRoom(title: String, purpose: String, agentIds: List<String>): CollaborationRoom
+    suspend fun deleteRoom(roomId: String)
 }
 
 data class OpenClawBackendConfig(
@@ -49,36 +59,45 @@ data class CreateRoomRequest(
 )
 
 interface OpenClawTransport {
+    suspend fun fetchAgents(): List<Agent>
     suspend fun fetchRooms(): List<CollaborationRoom>
     suspend fun fetchRoomMessages(roomId: String): List<RoomMessage>
     suspend fun sendRoomMessage(request: SendRoomMessageRequest)
     suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom
+    suspend fun deleteRoom(roomId: String)
 }
 
 class FakeOpenClawRepository : OpenClawRepository {
     private val mutableRooms = AppSeedData.rooms.toMutableList()
     private val mutableMessages = AppSeedData.messagesByRoom.toMutableMap()
 
+    override suspend fun getAgents(): List<Agent> = AppSeedData.agents
+
     override suspend fun getRooms(): List<CollaborationRoom> = mutableRooms
 
     override suspend fun getRoomMessages(roomId: String): List<RoomMessage> = mutableMessages[roomId].orEmpty()
 
     override suspend fun sendMessage(roomId: String, text: String) {
+        val timestampMs = System.currentTimeMillis()
         val current = mutableMessages[roomId].orEmpty()
         mutableMessages[roomId] = current + RoomMessage(
-            id = "user-${System.currentTimeMillis()}",
+            id = "user-$timestampMs",
             senderId = "solo",
             senderName = "SoLo",
             senderRole = "Operator",
             senderType = MessageSenderType.USER,
             body = text,
-            timestampLabel = "Now"
+            timestampLabel = "Now",
+            internal = false,
+            messageKey = buildMessageKey("user", "solo", text, timestampMs),
+            timestampMs = timestampMs
         )
     }
 
     override suspend fun createRoom(title: String, purpose: String, agentIds: List<String>): CollaborationRoom {
+        val timestampMs = System.currentTimeMillis()
         val room = CollaborationRoom(
-            id = title.lowercase().replace(" ", "-") + "-${System.currentTimeMillis()}",
+            id = title.lowercase().replace(" ", "-") + "-$timestampMs",
             title = title,
             purpose = purpose,
             members = agentIds,
@@ -89,27 +108,37 @@ class FakeOpenClawRepository : OpenClawRepository {
         mutableRooms.add(0, room)
         mutableMessages[room.id] = listOf(
             RoomMessage(
-                id = "system-${System.currentTimeMillis()}",
+                id = "system-$timestampMs",
                 senderId = "system",
                 senderName = "System",
                 senderRole = "Room Created",
                 senderType = MessageSenderType.SYSTEM,
                 body = "Room created with ${agentIds.size} agents.",
-                timestampLabel = "Now"
+                timestampLabel = "Now",
+                internal = true,
+                messageKey = buildMessageKey("system", "system", "Room created with ${agentIds.size} agents.", timestampMs),
+                timestampMs = timestampMs
             )
         )
         return room
+    }
+
+    override suspend fun deleteRoom(roomId: String) {
+        mutableRooms.removeAll { it.id == roomId }
+        mutableMessages.remove(roomId)
     }
 }
 
 class RealOpenClawRepository(
     private val transport: OpenClawTransport
 ) : OpenClawRepository {
+    override suspend fun getAgents(): List<Agent> = transport.fetchAgents()
     override suspend fun getRooms(): List<CollaborationRoom> = transport.fetchRooms()
     override suspend fun getRoomMessages(roomId: String): List<RoomMessage> = transport.fetchRoomMessages(roomId)
     override suspend fun sendMessage(roomId: String, text: String) = transport.sendRoomMessage(SendRoomMessageRequest(roomId, text))
     override suspend fun createRoom(title: String, purpose: String, agentIds: List<String>): CollaborationRoom =
         transport.createRoom(CreateRoomRequest(title, purpose, agentIds))
+    override suspend fun deleteRoom(roomId: String) = transport.deleteRoom(roomId)
 }
 
 class GatewayRpcOpenClawTransport(
@@ -121,52 +150,135 @@ class GatewayRpcOpenClawTransport(
 
     private val deviceAuthStore = OpenClawDeviceAuthStore(context)
     private val deviceIdentity = OpenClawDeviceIdentity(deviceAuthStore)
+    private val localRoomStore = LocalRoomStore(context)
     private val localRooms = linkedMapOf<String, CollaborationRoom>()
     private val localMessages = linkedMapOf<String, MutableList<RoomMessage>>()
+    private val localRoomReplyCursor = linkedMapOf<String, MutableMap<String, String?>>()
+    private val localRoomSessionKeys = linkedMapOf<String, Map<String, String>>()
+    private val localRoomMemberNames = linkedMapOf<String, Map<String, String>>()
+    @Volatile
+    private var cachedAgents: List<Agent> = emptyList()
 
     private val client = okHttpClient ?: OkHttpClient.Builder()
         .pingInterval(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
+    init {
+        restoreLocalRooms()
+    }
+
+    override suspend fun fetchAgents(): List<Agent> = withContext(dispatcher) {
+        val agents = runCatching {
+            val response = request(method = "agents.list", params = emptyMap())
+            parseAgents(response)
+        }.getOrElse { error ->
+            Log.w("OpenClawGateway", "agents.list failed, deriving agents from sessions", error)
+            deriveAgentsFromSessions()
+        }
+        cachedAgents = agents
+        agents
+    }
+
     override suspend fun fetchRooms(): List<CollaborationRoom> = withContext(dispatcher) {
+        val agents = cachedAgents.ifEmpty { fetchAgents() }
         val response = request(
             method = "sessions.list",
             params = mapOf(
-                "limit" to 20,
+                "limit" to 100,
                 "includeGlobal" to true,
                 "includeUnknown" to false
             )
         )
 
         val sessions = response["sessions"] as? List<*> ?: emptyList<Any>()
-        val matched = sessions.mapNotNull { it as? Map<*, *> }
-            .filter { (it["key"] as? String) == config.sessionKey }
+        val sessionMaps = sessions.mapNotNull { it as? Map<*, *> }
 
-        val remoteRooms = if (matched.isEmpty()) {
-            listOf(
-                CollaborationRoom(
-                    id = config.sessionKey,
-                    title = friendlySessionTitle(config.sessionKey),
-                    purpose = "Live OpenClaw session",
-                    members = listOf(agentIdFromSessionKey(config.sessionKey)),
-                    unreadCount = 0,
-                    active = true,
-                    lastActivity = "Live"
+        val remoteRooms = if (agents.isEmpty()) {
+            val matched = sessionMaps.filter { (it["key"] as? String) == config.sessionKey }
+            if (matched.isEmpty()) {
+                listOf(
+                    CollaborationRoom(
+                        id = config.sessionKey,
+                        title = friendlySessionTitle(config.sessionKey),
+                        purpose = "Live OpenClaw session",
+                        members = listOf(agentIdFromSessionKey(config.sessionKey)),
+                        unreadCount = 0,
+                        active = true,
+                        lastActivity = "Live",
+                        sessionLabel = sessionLabelForKey(config.sessionKey)
+                    )
                 )
-            )
+            } else {
+                matched.map { session ->
+                    val key = session["key"] as? String ?: config.sessionKey
+                    CollaborationRoom(
+                        id = key,
+                        title = sessionDisplayName(session) ?: friendlySessionTitle(key),
+                        purpose = "Live OpenClaw session",
+                        members = listOf(agentIdFromSessionKey(key)),
+                        unreadCount = 0,
+                        active = true,
+                        lastActivity = sessionUpdatedLabel(session),
+                        sessionLabel = sessionDisplayLabel(session, key, friendlySessionTitle(key))
+                    )
+                }
+            }
         } else {
-            matched.map { session ->
-                val key = session["key"] as? String ?: config.sessionKey
-                CollaborationRoom(
-                    id = key,
-                    title = session["label"] as? String ?: friendlySessionTitle(key),
-                    purpose = "Live OpenClaw session",
-                    members = listOf(agentIdFromSessionKey(key)),
-                    unreadCount = 0,
-                    active = true,
-                    lastActivity = "Live"
-                )
+            agents.flatMap { agent ->
+                val agentSessions = sessionMaps
+                    .filter { sessionBelongsToAgent(it, agent.id) }
+                    .sortedByDescending { (it["updatedAt"] as? Number)?.toLong() ?: Long.MIN_VALUE }
+                val mainSessionKey = agentMainSessionKey(agent.id)
+                val hasMainSession = agentSessions.any { session ->
+                    (session["key"] as? String)?.equals(mainSessionKey, ignoreCase = true) == true
+                }
+
+                if (agentSessions.isEmpty() || !hasMainSession) {
+                    val mainRoom = CollaborationRoom(
+                        id = mainSessionKey,
+                        title = agent.name,
+                        purpose = "Direct chat with ${agent.name}",
+                        members = listOf(agent.id),
+                        unreadCount = 0,
+                        active = mainSessionKey == config.sessionKey,
+                        lastActivity = if (agentSessions.isEmpty()) "Live" else "Available",
+                        sessionLabel = "Main"
+                    )
+                    if (agentSessions.isEmpty()) {
+                        listOf(mainRoom)
+                    } else {
+                        listOf(mainRoom) + agentSessions.map { session ->
+                            val roomId = session["key"] as? String ?: mainSessionKey
+                            val sessionLabel = sessionDisplayLabel(session, roomId, agent.name)
+                            CollaborationRoom(
+                                id = roomId,
+                                title = agent.name,
+                                purpose = "Direct chat with ${agent.name}",
+                                members = listOf(agent.id),
+                                unreadCount = 0,
+                                active = roomId == config.sessionKey,
+                                lastActivity = sessionUpdatedLabel(session),
+                                sessionLabel = sessionLabel
+                            )
+                        }
+                    }
+                } else {
+                    agentSessions.map { session ->
+                        val roomId = session["key"] as? String ?: agentMainSessionKey(agent.id)
+                        val sessionLabel = sessionDisplayLabel(session, roomId, agent.name)
+                        CollaborationRoom(
+                            id = roomId,
+                            title = agent.name,
+                            purpose = "Direct chat with ${agent.name}",
+                            members = listOf(agent.id),
+                            unreadCount = 0,
+                            active = roomId == config.sessionKey,
+                            lastActivity = sessionUpdatedLabel(session),
+                            sessionLabel = sessionLabel
+                        )
+                    }
+                }
             }
         }
 
@@ -175,8 +287,209 @@ class GatewayRpcOpenClawTransport(
     }
 
     override suspend fun fetchRoomMessages(roomId: String): List<RoomMessage> = withContext(dispatcher) {
-        localMessages[roomId]?.let { return@withContext it.toList() }
+        if (localRooms.containsKey(roomId)) {
+            syncLocalRoomReplies(roomId, awaitReplies = false)
+            return@withContext localMessages[roomId].orEmpty().toList()
+        }
 
+        fetchRemoteRoomMessages(roomId)
+    }
+
+    override suspend fun sendRoomMessage(request: SendRoomMessageRequest) {
+        withContext(dispatcher) {
+            val localRoom = localRooms[request.roomId]
+            if (localRoom != null) {
+                val roomMessages = localMessages.getOrPut(request.roomId) { mutableListOf() }
+                val memberSessionKeys = localRoomSessionKeys[request.roomId].orEmpty()
+                val userTimestampMs = System.currentTimeMillis()
+                roomMessages += RoomMessage(
+                    id = "local-user-$userTimestampMs",
+                    senderId = "solo",
+                    senderName = "SoLo",
+                    senderRole = "Operator",
+                    senderType = MessageSenderType.USER,
+                    body = request.text,
+                    timestampLabel = "Now",
+                    internal = false,
+                    messageKey = buildMessageKey("user", "solo", request.text, userTimestampMs),
+                    timestampMs = userTimestampMs
+                )
+
+                val targetAgentIds = resolveLocalRoomTargets(localRoom, roomMessages, request.text)
+                if (targetAgentIds.isEmpty()) {
+                    val systemTimestampMs = System.currentTimeMillis()
+                    roomMessages += RoomMessage(
+                        id = "local-system-$systemTimestampMs",
+                        senderId = "system",
+                        senderName = "System",
+                        senderRole = "Routing",
+                        senderType = MessageSenderType.SYSTEM,
+                        body = "No agent was targeted. In group rooms, use @agent-name for one agent or @all for the full room.",
+                        timestampLabel = "Now",
+                        internal = true,
+                        messageKey = buildMessageKey(
+                            "system",
+                            "system",
+                            "No agent was targeted. In group rooms, use @agent-name for one agent or @all for the full room.",
+                            systemTimestampMs
+                        ),
+                        timestampMs = systemTimestampMs
+                    )
+                    persistLocalRooms()
+                    return@withContext
+                }
+
+                Log.d(
+                    "OpenClawGateway",
+                    "Routing local room message roomId=${request.roomId} targets=${targetAgentIds.joinToString()} memberCount=${localRoom.members.size}"
+                )
+
+                val failedAgents = mutableListOf<String>()
+                targetAgentIds.forEach { agentId ->
+                    val sessionKey = memberSessionKeys[agentId] ?: agentMainSessionKey(agentId)
+                    runCatching {
+                        sendRemoteChatMessage(
+                            sessionKey = sessionKey,
+                            text = buildGroupRelayPrompt(
+                                room = localRoom,
+                                roomMessages = roomMessages,
+                                currentAgentId = agentId,
+                                addressedAgentIds = targetAgentIds,
+                                latestUserMessage = request.text
+                            ),
+                            idempotencyKey = "local-room-${request.roomId}-$agentId-${System.currentTimeMillis()}"
+                        )
+                    }.onFailure { error ->
+                        Log.e("OpenClawGateway", "Failed relaying local room message to $agentId", error)
+                        failedAgents += agentId
+                    }
+                }
+
+                if (failedAgents.isNotEmpty()) {
+                    val systemTimestampMs = System.currentTimeMillis()
+                    roomMessages += RoomMessage(
+                        id = "local-system-$systemTimestampMs",
+                        senderId = "system",
+                        senderName = "System",
+                        senderRole = "Delivery",
+                        senderType = MessageSenderType.SYSTEM,
+                        body = "Could not reach: ${failedAgents.joinToString(", ")}",
+                        timestampLabel = "Now",
+                        internal = true,
+                        messageKey = buildMessageKey(
+                            "system",
+                            "system",
+                            "Could not reach: ${failedAgents.joinToString(", ")}",
+                            systemTimestampMs
+                        ),
+                        timestampMs = systemTimestampMs
+                    )
+                }
+
+                syncLocalRoomReplies(request.roomId, awaitReplies = true)
+                persistLocalRooms()
+                return@withContext
+            }
+
+            sendRemoteChatMessage(
+                sessionKey = request.roomId,
+                text = request.text,
+                idempotencyKey = "android-${System.currentTimeMillis()}"
+            )
+            delay(500)
+        }
+    }
+
+    override suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom = withContext(dispatcher) {
+        val timestampMs = System.currentTimeMillis()
+        val room = CollaborationRoom(
+            id = "local-room-$timestampMs",
+            title = request.title.ifBlank { friendlySessionTitle(config.sessionKey) },
+            purpose = request.purpose.ifBlank { "Shared team room" },
+            members = request.agentIds.ifEmpty { listOf(agentIdFromSessionKey(config.sessionKey)) },
+            unreadCount = 0,
+            active = true,
+            lastActivity = "Now"
+        )
+        val memberSessionKeys = room.members.distinct().associateWith { agentId ->
+            groupRelaySessionKey(agentId = agentId, roomId = room.id, roomTitle = room.title)
+        }
+        val knownAgents = cachedAgents.ifEmpty { runCatching { fetchAgents() }.getOrDefault(emptyList()) }
+            .associateBy { it.id.lowercase() }
+        val memberNames = room.members.distinct().associateWith { agentId ->
+            knownAgents[agentId.lowercase()]?.name ?: prettifyId(agentId)
+        }
+        localRooms[room.id] = room
+        localRoomSessionKeys[room.id] = memberSessionKeys
+        localRoomMemberNames[room.id] = memberNames
+        localMessages[room.id] = mutableListOf(
+            RoomMessage(
+                id = "local-room-created-$timestampMs",
+                senderId = "system",
+                senderName = "System",
+                senderRole = "Room Created",
+                senderType = MessageSenderType.SYSTEM,
+                body = "Room created for ${room.members.joinToString(", ")}. Use @agent-name to target one agent, or @all to broadcast to the full room. Messages will be relayed into room-specific agent sessions for ${room.title}.",
+                timestampLabel = "Now",
+                internal = true,
+                messageKey = buildMessageKey(
+                    "system",
+                    "system",
+                    "Room created for ${room.members.joinToString(", ")}. Use @agent-name to target one agent, or @all to broadcast to the full room. Messages will be relayed into room-specific agent sessions for ${room.title}.",
+                    timestampMs
+                ),
+                timestampMs = timestampMs
+            )
+        )
+        localRoomReplyCursor[room.id] = memberSessionKeys.mapValues { (_, sessionKey) ->
+            latestAssistantMessageKey(sessionKey)
+        }.toMutableMap()
+        persistLocalRooms()
+        return@withContext room
+    }
+
+    override suspend fun deleteRoom(roomId: String) = withContext(dispatcher) {
+        if (localRooms.containsKey(roomId)) {
+            val sessionKeys = localRoomSessionKeys[roomId].orEmpty().values.distinct()
+            val failedSessionKeys = mutableListOf<String>()
+            sessionKeys.forEach { sessionKey ->
+                runCatching {
+                    deleteGatewaySession(sessionKey)
+                }.onFailure { error ->
+                    Log.e("OpenClawGateway", "Failed deleting relay session $sessionKey for roomId=$roomId", error)
+                    failedSessionKeys += sessionKey
+                }
+            }
+
+            if (failedSessionKeys.isNotEmpty()) {
+                throw IllegalStateException(
+                    "Could not delete all room sessions: ${failedSessionKeys.joinToString(", ")}"
+                )
+            }
+
+            localRooms.remove(roomId)
+            localMessages.remove(roomId)
+            localRoomReplyCursor.remove(roomId)
+            localRoomSessionKeys.remove(roomId)
+            localRoomMemberNames.remove(roomId)
+            persistLocalRooms()
+            return@withContext
+        }
+
+        if (!roomId.startsWith("agent:")) {
+            throw IllegalArgumentException("Only group rooms and direct agent sessions can be deleted.")
+        }
+
+        if (isMainSessionKey(roomId)) {
+            throw IllegalArgumentException("Main direct sessions cannot be deleted.")
+        }
+
+        Log.d("OpenClawGateway", "Deleting remote session key=$roomId")
+        deleteGatewaySession(roomId)
+        Log.d("OpenClawGateway", "Deleted remote session key=$roomId")
+    }
+
+    private suspend fun fetchRemoteRoomMessages(roomId: String): List<RoomMessage> {
         val response = request(
             method = "chat.history",
             params = mapOf(
@@ -186,113 +499,62 @@ class GatewayRpcOpenClawTransport(
         )
 
         val messages = response["messages"] as? List<*> ?: emptyList<Any>()
-        messages.mapIndexedNotNull { index, raw ->
+        return messages.mapIndexedNotNull { index, raw ->
             val message = raw as? Map<*, *> ?: return@mapIndexedNotNull null
             val role = (message["role"] as? String)?.lowercase() ?: "assistant"
             val content = flattenContent(message["content"])
                 ?: (message["text"] as? String)
                 ?: return@mapIndexedNotNull null
+            val timestampMs = parseTimestampMs(message["timestamp"] ?: message["timestampMs"] ?: message["ts"])
+            val senderId = when (role) {
+                "user" -> "solo"
+                "assistant" -> agentIdFromSessionKey(roomId)
+                else -> "system"
+            }
+            val messageKey = buildMessageKey(role, senderId, content, timestampMs ?: index.toLong())
+            val internal = isInternalHistoryMessage(role, content, message)
 
             when (role) {
                 "user" -> RoomMessage(
-                    id = "history-user-$index",
-                    senderId = "solo",
+                    id = messageKey,
+                    senderId = senderId,
                     senderName = "SoLo",
                     senderRole = "Operator",
                     senderType = MessageSenderType.USER,
                     body = content,
-                    timestampLabel = "History"
+                    timestampLabel = formatTimestampLabel(timestampMs),
+                    internal = internal,
+                    messageKey = messageKey,
+                    timestampMs = timestampMs
                 )
 
                 "assistant" -> RoomMessage(
-                    id = "history-assistant-$index",
-                    senderId = agentIdFromSessionKey(roomId),
+                    id = messageKey,
+                    senderId = senderId,
                     senderName = friendlySessionTitle(roomId),
                     senderRole = "Agent",
                     senderType = MessageSenderType.AGENT,
                     body = content,
-                    timestampLabel = "History"
+                    timestampLabel = formatTimestampLabel(timestampMs),
+                    internal = internal,
+                    messageKey = messageKey,
+                    timestampMs = timestampMs
                 )
 
                 else -> RoomMessage(
-                    id = "history-system-$index",
-                    senderId = "system",
+                    id = messageKey,
+                    senderId = senderId,
                     senderName = role.replaceFirstChar { it.uppercase() },
                     senderRole = "System",
                     senderType = MessageSenderType.SYSTEM,
                     body = content,
-                    timestampLabel = "History"
+                    timestampLabel = formatTimestampLabel(timestampMs),
+                    internal = internal,
+                    messageKey = messageKey,
+                    timestampMs = timestampMs
                 )
             }
         }
-    }
-
-    override suspend fun sendRoomMessage(request: SendRoomMessageRequest) {
-        withContext(dispatcher) {
-            localMessages[request.roomId]?.let { roomMessages ->
-                roomMessages += RoomMessage(
-                    id = "local-user-${System.currentTimeMillis()}",
-                    senderId = "solo",
-                    senderName = "SoLo",
-                    senderRole = "Operator",
-                    senderType = MessageSenderType.USER,
-                    body = request.text,
-                    timestampLabel = "Now"
-                )
-                roomMessages += RoomMessage(
-                    id = "local-system-${System.currentTimeMillis()}",
-                    senderId = "system",
-                    senderName = "System",
-                    senderRole = "Local Room",
-                    senderType = MessageSenderType.SYSTEM,
-                    body = "This room exists locally in the app. Backend room sync is not wired yet.",
-                    timestampLabel = "Now"
-                )
-                return@withContext
-            }
-
-            Log.d(
-                "OpenClawGateway",
-                "chat.send sessionKey=${request.roomId} length=${request.text.length} deliver=true"
-            )
-            this@GatewayRpcOpenClawTransport.request(
-                method = "chat.send",
-                params = mapOf(
-                    "sessionKey" to request.roomId,
-                    "message" to request.text,
-                    "deliver" to true,
-                    "thinking" to "medium",
-                    "timeoutMs" to 30_000,
-                    "idempotencyKey" to "android-${System.currentTimeMillis()}"
-                )
-            )
-            delay(500)
-        }
-    }
-
-    override suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom {
-        val room = CollaborationRoom(
-            id = "local-room-${System.currentTimeMillis()}",
-            title = request.title.ifBlank { friendlySessionTitle(config.sessionKey) },
-            purpose = request.purpose.ifBlank { "Live OpenClaw session" },
-            members = request.agentIds.ifEmpty { listOf(agentIdFromSessionKey(config.sessionKey)) },
-            unreadCount = 0,
-            active = true,
-            lastActivity = "Now"
-        )
-        localRooms[room.id] = room
-        localMessages[room.id] = mutableListOf(
-            RoomMessage(
-                id = "local-room-created-${System.currentTimeMillis()}",
-                senderId = "system",
-                senderName = "System",
-                senderRole = "Room Created",
-                senderType = MessageSenderType.SYSTEM,
-                body = "Room created locally with ${room.members.size} agents. Backend room creation is not available yet.",
-                timestampLabel = "Now"
-            )
-        )
-        return room
     }
 
     private suspend fun request(method: String, params: Map<String, Any?>): Map<String, Any?> = withContext(dispatcher) {
@@ -355,13 +617,12 @@ class GatewayRpcOpenClawTransport(
                     val signedAt = System.currentTimeMillis()
                     val deviceId = deviceIdentity.deviceId()
                     val publicKey = deviceIdentity.publicKeyBase64Url()
-                    val requestedScopes = listOf("operator.read", "operator.write", "operator.talk.secrets")
                     val payload = buildDeviceAuthPayloadV3(
                         deviceId = deviceId,
                         clientId = clientId,
                         clientMode = "ui",
                         role = "operator",
-                        scopes = requestedScopes,
+                        scopes = REQUESTED_OPERATOR_SCOPES,
                         signedAtMs = signedAt,
                         token = sharedToken,
                         nonce = challenge,
@@ -396,7 +657,7 @@ class GatewayRpcOpenClawTransport(
                         "instanceId" to instanceId
                     ))
                     put("role", "operator")
-                    put("scopes", listOf("operator.read", "operator.write", "operator.talk.secrets"))
+                    put("scopes", REQUESTED_OPERATOR_SCOPES)
                     auth?.let { put("auth", it) }
                     device?.let { put("device", it) }
                     put("userAgent", "OpenClaw Agents Android/0.1.0")
@@ -516,6 +777,256 @@ class GatewayRpcOpenClawTransport(
         }
     }
 
+    private fun parseTimestampMs(raw: Any?): Long? {
+        return when (raw) {
+            is Number -> raw.toLong()
+            is String -> raw.toLongOrNull()
+            else -> null
+        }
+    }
+
+    private fun isInternalHistoryMessage(
+        role: String,
+        content: String,
+        message: Map<*, *>
+    ): Boolean {
+        if (role != "assistant" && role != "user") {
+            return true
+        }
+        val contentLower = content.lowercase()
+        val classifiedType = listOf("type", "kind", "channel", "subtype")
+            .mapNotNull { key -> message[key] as? String }
+            .joinToString(" ")
+            .lowercase()
+        if (classifiedType.contains("tool") || classifiedType.contains("reason") || classifiedType.contains("think")) {
+            return true
+        }
+        val internalMarkers = listOf(
+            "<tool_call",
+            "</tool_call>",
+            "<function_call",
+            "</function_call>",
+            "<tool_calls",
+            "</tool_calls>",
+            "<function_calls",
+            "</function_calls>",
+            "<thinking",
+            "</thinking>",
+            "tool call:",
+            "function call:",
+            "thinking:",
+            "reasoning:"
+        )
+        return internalMarkers.any(contentLower::contains)
+    }
+
+    private fun formatTimestampLabel(timestampMs: Long?): String {
+        if (timestampMs == null) return "History"
+        val minutes = ((System.currentTimeMillis() - timestampMs) / 60_000L).coerceAtLeast(0L)
+        return when {
+            minutes <= 1L -> "Now"
+            minutes < 60L -> "${minutes}m ago"
+            else -> "History"
+        }
+    }
+
+    private suspend fun sendRemoteChatMessage(
+        sessionKey: String,
+        text: String,
+        idempotencyKey: String
+    ) {
+        Log.d(
+            "OpenClawGateway",
+            "chat.send sessionKey=$sessionKey length=${text.length} deliver=true"
+        )
+        request(
+            method = "chat.send",
+            params = mapOf(
+                "sessionKey" to sessionKey,
+                "message" to text,
+                "deliver" to true,
+                "thinking" to "medium",
+                "timeoutMs" to 30_000,
+                "idempotencyKey" to idempotencyKey
+            )
+        )
+    }
+
+    private suspend fun latestAssistantMessageKey(sessionKey: String): String? {
+        return runCatching {
+            fetchRemoteRoomMessages(sessionKey)
+                .lastOrNull { it.senderType == MessageSenderType.AGENT }
+                ?.messageKey
+        }.getOrElse { error ->
+            Log.w("OpenClawGateway", "Failed to snapshot assistant cursor for $sessionKey", error)
+            null
+        }
+    }
+
+    private suspend fun syncLocalRoomReplies(roomId: String, awaitReplies: Boolean) {
+        val attempts = if (awaitReplies) 6 else 1
+        var sawReply = false
+        repeat(attempts) { attempt ->
+            val added = syncLocalRoomRepliesOnce(roomId)
+            sawReply = sawReply || added
+            if (!awaitReplies) return
+            if (sawReply && !added) return
+            if (attempt < attempts - 1) {
+                delay(1_000)
+            }
+        }
+    }
+
+    private suspend fun syncLocalRoomRepliesOnce(roomId: String): Boolean {
+        val room = localRooms[roomId] ?: return false
+        val roomMessages = localMessages[roomId] ?: return false
+        val cursors = localRoomReplyCursor.getOrPut(roomId) { mutableMapOf() }
+        val sessionKeys = localRoomSessionKeys[roomId].orEmpty()
+        var addedAny = false
+
+        room.members.distinct().forEach { agentId ->
+            val sessionKey = sessionKeys[agentId] ?: agentMainSessionKey(agentId)
+            val history = runCatching { fetchRemoteRoomMessages(sessionKey) }
+                .getOrElse { error ->
+                    Log.w("OpenClawGateway", "Failed syncing replies for $agentId", error)
+                    return@forEach
+                }
+            val assistantMessages = history.filter { it.senderType == MessageSenderType.AGENT }
+            Log.d(
+                "OpenClawGateway",
+                "syncLocalRoomReplies roomId=$roomId agentId=$agentId sessionKey=$sessionKey historyCount=${history.size} assistantCount=${assistantMessages.size} previousKey=${cursors[agentId]}"
+            )
+            if (assistantMessages.isEmpty()) return@forEach
+
+            val previousKey = cursors[agentId]
+            val newMessages = when {
+                previousKey.isNullOrBlank() -> assistantMessages
+                else -> {
+                    val lastSeenIndex = assistantMessages.indexOfLast { it.messageKey == previousKey }
+                    if (lastSeenIndex >= 0) {
+                        assistantMessages.drop(lastSeenIndex + 1)
+                    } else {
+                        assistantMessages.takeLast(1)
+                    }
+                }
+            }
+            Log.d(
+                "OpenClawGateway",
+                "syncLocalRoomReplies roomId=$roomId agentId=$agentId newAssistantCount=${newMessages.size}"
+            )
+
+            newMessages.forEach { message ->
+                val mirroredId = "local-room-$roomId-${message.messageKey}"
+                if (roomMessages.any { it.id == mirroredId }) return@forEach
+                roomMessages += message.copy(
+                    id = mirroredId,
+                    messageKey = mirroredId,
+                    senderName = resolveRoomAgentDisplayName(roomId, agentId),
+                    internal = message.internal,
+                    senderRole = message.senderRole.ifBlank { "Agent" }
+                )
+                addedAny = true
+                Log.d(
+                    "OpenClawGateway",
+                    "Mirrored group reply roomId=$roomId agentId=$agentId mirroredId=$mirroredId bodyLength=${message.body.length}"
+                )
+            }
+
+            cursors[agentId] = assistantMessages.last().messageKey
+        }
+
+        if (addedAny && roomMessages.isNotEmpty()) {
+            localRooms[roomId] = room.copy(lastActivity = roomMessages.last().timestampLabel)
+            persistLocalRooms()
+        }
+        return addedAny
+    }
+
+    private fun restoreLocalRooms() {
+        val snapshot = localRoomStore.read()
+        snapshot.rooms.forEach { room ->
+            localRooms[room.id] = room
+        }
+        snapshot.messages.forEach { (roomId, messages) ->
+            localMessages[roomId] = messages.toMutableList()
+        }
+        snapshot.replyCursors.forEach { (roomId, cursors) ->
+            localRoomReplyCursor[roomId] = cursors.toMutableMap()
+        }
+        localRoomSessionKeys.putAll(snapshot.sessionKeys)
+        localRoomMemberNames.putAll(snapshot.memberNames)
+    }
+
+    private fun persistLocalRooms() {
+        localRoomStore.write(
+            LocalRoomSnapshot(
+                rooms = localRooms.values.toList(),
+                messages = localMessages.mapValues { it.value.toList() },
+                replyCursors = localRoomReplyCursor.mapValues { it.value.toMap() },
+                sessionKeys = localRoomSessionKeys.toMap(),
+                memberNames = localRoomMemberNames.toMap()
+            )
+        )
+    }
+
+    private fun groupRelaySessionKey(agentId: String, roomId: String, roomTitle: String): String {
+        val slug = roomTitle
+            .lowercase()
+            .replace(Regex("[^a-z0-9]+"), "-")
+            .trim('-')
+            .take(24)
+            .ifBlank { "team-room" }
+        val suffix = roomId.substringAfterLast('-').takeLast(8).ifBlank { "room" }
+        return "agent:$agentId:room:$slug-$suffix"
+    }
+
+    private fun parseAgents(response: Map<String, Any?>): List<Agent> {
+        val defaultId = (response["defaultId"] as? String)?.trim().orEmpty()
+        val agents = response["agents"] as? List<*> ?: emptyList<Any>()
+        return agents.mapNotNull { raw ->
+            val agent = raw as? Map<*, *> ?: return@mapNotNull null
+            val id = (agent["id"] as? String)?.trim().orEmpty()
+            if (id.isEmpty()) return@mapNotNull null
+            val identity = agent["identity"] as? Map<*, *>
+            val name = (agent["name"] as? String)?.trim().takeUnless { it.isNullOrEmpty() } ?: prettifyId(id)
+            val emoji = (identity?.get("emoji") as? String)?.trim().orEmpty()
+            Agent(
+                id = id,
+                name = name,
+                role = if (id == defaultId) "Default Agent" else "OpenClaw Agent",
+                status = if (id == defaultId) "Default" else "Ready",
+                accent = accentColorForAgent(id),
+                summary = buildAgentSummary(name, emoji)
+            )
+        }.sortedBy { it.name.lowercase() }
+    }
+
+    private suspend fun deriveAgentsFromSessions(): List<Agent> {
+        val response = request(
+            method = "sessions.list",
+            params = mapOf(
+                "limit" to 100,
+                "includeGlobal" to true,
+                "includeUnknown" to false
+            )
+        )
+        val sessions = response["sessions"] as? List<*> ?: emptyList<Any>()
+        return sessions.mapNotNull { raw ->
+            val session = raw as? Map<*, *> ?: return@mapNotNull null
+            val key = session["key"] as? String ?: return@mapNotNull null
+            if (!key.startsWith("agent:")) return@mapNotNull null
+            val agentId = agentIdFromSessionKey(key)
+            Agent(
+                id = agentId,
+                name = sessionDisplayName(session) ?: prettifyId(agentId),
+                role = "OpenClaw Agent",
+                status = "Ready",
+                accent = accentColorForAgent(agentId),
+                summary = "Live OpenClaw agent discovered from gateway sessions."
+            )
+        }.distinctBy { it.id }.sortedBy { it.name.lowercase() }
+    }
+
     private fun summarizeParams(params: Map<String, Any?>): String {
         return params.entries.joinToString(
             prefix = "{",
@@ -582,9 +1093,221 @@ class GatewayRpcOpenClawTransport(
         return agent.replaceFirstChar { it.uppercase() }
     }
 
+    private suspend fun resolveLocalRoomTargets(
+        room: CollaborationRoom,
+        roomMessages: List<RoomMessage>,
+        latestUserMessage: String
+    ): List<String> {
+        val members = room.members.distinct()
+        if (members.size <= 1) return members
+
+        if (isBroadcastMessage(latestUserMessage)) {
+            return members
+        }
+
+        val normalizedMessage = latestUserMessage.lowercase()
+        val explicitTargets = members.filter { agentId ->
+            val aliases = buildAgentAliases(agentId, room.id)
+            aliases.any { alias ->
+                normalizedMessage.contains("@$alias") || normalizedMessage.contains(alias)
+            }
+        }
+        if (explicitTargets.isNotEmpty()) {
+            return explicitTargets
+        }
+
+        val previousAgentTarget = roomMessages
+            .asReversed()
+            .firstOrNull { it.senderType == MessageSenderType.AGENT && members.contains(it.senderId) }
+            ?.senderId
+        return previousAgentTarget?.let(::listOf) ?: members
+    }
+
+    private fun isBroadcastMessage(text: String): Boolean {
+        val normalized = text.lowercase()
+        return listOf("@all", "everyone", "everybody", "all of you", "whole team", "entire team")
+            .any { normalized.contains(it) }
+    }
+
+    private fun buildAgentAliases(agentId: String, roomId: String): Set<String> {
+        val agentName = resolveRoomAgentDisplayName(roomId, agentId)
+        val values = linkedSetOf<String>()
+        values += sanitizeAlias(agentId)
+        values += sanitizeAlias(prettifyId(agentId))
+        agentName?.let {
+            values += sanitizeAlias(it)
+            it.split(' ', '-', '_').map(::sanitizeAlias).filterTo(values) { alias -> alias.isNotBlank() }
+        }
+        return values.filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun sanitizeAlias(value: String): String {
+        return value.lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
+    }
+
+    private fun buildGroupRelayPrompt(
+        room: CollaborationRoom,
+        roomMessages: List<RoomMessage>,
+        currentAgentId: String,
+        addressedAgentIds: List<String>,
+        latestUserMessage: String
+    ): String {
+        val participantLine = room.members.distinct().joinToString(", ") { resolveRoomAgentDisplayName(room.id, it) }
+        val addressedLine = addressedAgentIds.joinToString(", ") { resolveRoomAgentDisplayName(room.id, it) }
+        val currentAgentName = resolveRoomAgentDisplayName(room.id, currentAgentId)
+        val transcript = buildRecentGroupTranscript(roomMessages)
+        return buildString {
+            appendLine("You are participating in the OpenClaw group room \"${room.title}\".")
+            appendLine("You are $currentAgentName.")
+            appendLine("Participants: $participantLine")
+            appendLine("This turn is addressed to: $addressedLine")
+            appendLine("Shared room purpose: ${room.purpose}")
+            appendLine()
+            appendLine("Recent room transcript:")
+            appendLine(transcript)
+            appendLine()
+            appendLine("Latest user message:")
+            appendLine(latestUserMessage)
+            appendLine()
+            append("Reply as $currentAgentName. Consider the recent room transcript so your response stays aware of what the rest of the team already said.")
+        }.trim()
+    }
+
+    private fun buildRecentGroupTranscript(roomMessages: List<RoomMessage>): String {
+        val transcriptLines = roomMessages
+            .filter { it.senderType != MessageSenderType.SYSTEM }
+            .takeLast(12)
+            .map { message ->
+                val speaker = when (message.senderType) {
+                    MessageSenderType.USER -> "SoLo"
+                    MessageSenderType.AGENT -> message.senderName
+                    MessageSenderType.SYSTEM -> "System"
+                }
+                "[$speaker] ${message.body.trim()}"
+        }
+        return transcriptLines.joinToString("\n").ifBlank { "[No prior conversation]" }
+    }
+
+    private fun resolveRoomAgentDisplayName(roomId: String, agentId: String): String {
+        return localRoomMemberNames[roomId]?.get(agentId)
+            ?: cachedAgents.firstOrNull { it.id.equals(agentId, ignoreCase = true) }?.name
+            ?: prettifyId(agentId)
+    }
+
+    private fun agentMainSessionKey(agentId: String): String = "agent:$agentId:main"
+
+    private suspend fun deleteGatewaySession(sessionKey: String) {
+        repeat(3) { attempt ->
+            runCatching {
+                request(
+                    method = "sessions.abort",
+                    params = mapOf("key" to sessionKey)
+                )
+            }.onSuccess { payload ->
+                Log.d("OpenClawGateway", "Abort before delete key=$sessionKey payloadKeys=${payload.keys}")
+            }.onFailure { error ->
+                Log.w("OpenClawGateway", "Abort before delete failed key=$sessionKey", error)
+            }
+
+            try {
+                val payload = request(
+                    method = "sessions.delete",
+                    params = mapOf(
+                        "key" to sessionKey,
+                        "deleteTranscript" to true
+                    )
+                )
+                Log.d(
+                    "OpenClawGateway",
+                    "Delete session result key=$sessionKey deleted=${payload["deleted"]} archived=${payload["archived"]}"
+                )
+                return
+            } catch (error: IllegalStateException) {
+                val message = error.message.orEmpty()
+                val shouldRetry = message.contains("still active", ignoreCase = true) && attempt < 2
+                if (!shouldRetry) {
+                    throw error
+                }
+                Log.w(
+                    "OpenClawGateway",
+                    "Delete session retrying key=$sessionKey attempt=${attempt + 1} reason=$message"
+                )
+                delay(1_000L * (attempt + 1))
+            }
+        }
+    }
+
+    private fun isMainSessionKey(sessionKey: String): Boolean {
+        return sessionKey.split(':').drop(2).firstOrNull().equals("main", ignoreCase = true)
+    }
+
+    private fun sessionBelongsToAgent(session: Map<*, *>, agentId: String): Boolean {
+        val sessionAgentId = (session["agentId"] as? String)?.trim()
+        val key = (session["key"] as? String)?.trim().orEmpty()
+        return sessionAgentId.equals(agentId, ignoreCase = true) || agentIdFromSessionKey(key).equals(agentId, ignoreCase = true)
+    }
+
+    private fun sessionDisplayLabel(session: Map<*, *>, key: String, agentName: String): String {
+        val display = sessionDisplayName(session)?.takeIf { !it.equals(agentName, ignoreCase = true) }
+        return display ?: sessionLabelForKey(key)
+    }
+
+    private fun sessionLabelForKey(key: String): String {
+        val parts = key.split(':')
+        if (parts.size < 3) return "Main"
+        val tail = parts.drop(2)
+        return when {
+            tail.firstOrNull().equals("main", ignoreCase = true) -> "Main"
+            tail.firstOrNull().equals("room", ignoreCase = true) -> tail.drop(1).joinToString(":").ifBlank { "Room Session" }
+            else -> tail.joinToString(":").ifBlank { "Session" }
+        }.replace('-', ' ').replaceFirstChar { it.uppercase() }
+    }
+
     private fun agentIdFromSessionKey(sessionKey: String): String {
         val parts = sessionKey.split(":")
         return if (parts.size >= 2 && parts.first() == "agent") parts[1] else sessionKey
+    }
+
+    private fun sessionDisplayName(session: Map<*, *>): String? {
+        return (session["displayName"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: (session["label"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun sessionUpdatedLabel(session: Map<*, *>?): String {
+        val updatedAt = (session?.get("updatedAt") as? Number)?.toLong()
+        if (updatedAt == null || updatedAt <= 0L) return "Live"
+        val minutes = ((System.currentTimeMillis() - updatedAt) / 60_000L).coerceAtLeast(0L)
+        return when {
+            minutes <= 1L -> "Now"
+            minutes < 60L -> "${minutes}m ago"
+            else -> "Live"
+        }
+    }
+
+    private fun prettifyId(id: String): String {
+        return id
+            .split('-', '_', ' ')
+            .filter { it.isNotBlank() }
+            .joinToString(" ") { token -> token.replaceFirstChar { it.uppercase() } }
+            .ifBlank { id }
+    }
+
+    private fun buildAgentSummary(name: String, emoji: String): String {
+        val intro = if (emoji.isNotEmpty()) "$emoji $name" else name
+        return "$intro is available through the OpenClaw gateway."
+    }
+
+    private fun accentColorForAgent(id: String): Long {
+        val palette = listOf(
+            0xFF38BDF8L,
+            0xFF22C55EL,
+            0xFFF97316L,
+            0xFFFB7185L,
+            0xFF7C5CFFL,
+            0xFFFACC15L
+        )
+        val index = id.lowercase().fold(0) { acc, char -> (acc * 31 + char.code) and Int.MAX_VALUE } % palette.size
+        return palette[index]
     }
 }
 
@@ -736,4 +1459,12 @@ private fun escapeJson(value: String): String {
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
+}
+
+private fun buildMessageKey(role: String, senderId: String, body: String, timestampMs: Long): String {
+    val normalized = listOf(role.trim().lowercase(), senderId.trim().lowercase(), timestampMs.toString(), body.trim())
+        .joinToString("|")
+    val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
+    val fingerprint = digest.joinToString("") { "%02x".format(it) }.take(16)
+    return "msg-$fingerprint"
 }
