@@ -41,7 +41,10 @@ import com.solovision.openclawagents.ui.screens.SkillsScreen
 import com.solovision.openclawagents.ui.theme.OpenClawAgentsTheme
 
 @Composable
-fun OpenClawAgentsApp() {
+fun OpenClawAgentsApp(
+    notificationTarget: String? = null,
+    onNotificationTargetConsumed: (String) -> Unit = {}
+) {
     val navController = rememberNavController()
     val context = LocalContext.current.applicationContext
     val viewModel: OpenClawViewModel = viewModel(factory = OpenClawViewModel.factory(context))
@@ -102,6 +105,27 @@ fun OpenClawAgentsApp() {
     fun openChat(roomId: String? = uiState.selectedRoomId ?: uiState.rooms.firstOrNull()?.id) {
         roomId?.let(viewModel::selectRoom)
         navigateToShellDestination(AppDestination.Chat)
+    }
+
+    LaunchedEffect(notificationTarget, uiState.rooms) {
+        val target = notificationTarget ?: return@LaunchedEffect
+        when {
+            target == AppDestination.Dashboard.route -> {
+                navigateToShellDestination(AppDestination.Dashboard)
+                onNotificationTargetConsumed(target)
+            }
+            target.startsWith("cron:") -> {
+                navigateToShellDestination(AppDestination.Cron)
+                onNotificationTargetConsumed(target)
+            }
+            uiState.rooms.any { it.id == target } -> {
+                openChat(target)
+                onNotificationTargetConsumed(target)
+            }
+            uiState.rooms.isNotEmpty() -> {
+                onNotificationTargetConsumed(target)
+            }
+        }
     }
 
     OpenClawAgentsTheme(themeMode = uiState.themeMode) {

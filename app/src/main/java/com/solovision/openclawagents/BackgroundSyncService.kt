@@ -136,7 +136,7 @@ class BackgroundSyncService : Service() {
         notificationPreferencesStore.writeLastNotifiedMessageKey(room.id, latestMessageKey)
         if (newMessages.isEmpty()) return
 
-        appNotificationManager.notifyNewMessage(room, newMessages.last(), newMessages.size)
+        appNotificationManager.notifyNewMessages(room, newMessages)
     }
 
     private fun maybeNotifyForCron(job: CronJob) {

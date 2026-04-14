@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 
 private const val CONVERSATION_DISPLAY_PREFS = "openclaw_conversation_display"
 private const val PREF_SHOW_INTERNAL_MESSAGES = "show_internal_messages"
+private const val PREF_LAST_OPENED_ROOM_ID = "last_opened_room_id"
 
 class ConversationDisplayStore private constructor(
     private val prefs: SharedPreferences?
@@ -22,5 +23,19 @@ class ConversationDisplayStore private constructor(
 
     fun writeShowInternalMessages(show: Boolean) {
         prefs?.edit()?.putBoolean(PREF_SHOW_INTERNAL_MESSAGES, show)?.apply()
+    }
+
+    fun readLastOpenedRoomId(): String? {
+        return prefs?.getString(PREF_LAST_OPENED_ROOM_ID, null)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    fun writeLastOpenedRoomId(roomId: String?) {
+        val editor = prefs?.edit() ?: return
+        if (roomId.isNullOrBlank()) {
+            editor.remove(PREF_LAST_OPENED_ROOM_ID)
+        } else {
+            editor.putString(PREF_LAST_OPENED_ROOM_ID, roomId.trim())
+        }
+        editor.apply()
     }
 }

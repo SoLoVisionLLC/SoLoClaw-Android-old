@@ -1,5 +1,6 @@
 package com.solovision.openclawagents.ui.screens
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,6 +22,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Campaign
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
@@ -56,6 +58,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -63,6 +68,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.text.selection.SelectionContainer
 import com.solovision.openclawagents.model.AppUiState
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
@@ -71,6 +77,7 @@ import com.solovision.openclawagents.model.VoiceOption
 import com.solovision.openclawagents.model.VoiceProfile
 import com.solovision.openclawagents.model.VoiceProvider
 import com.solovision.openclawagents.model.VoiceSettings
+import com.solovision.openclawagents.ui.components.AgentAvatar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -805,6 +812,8 @@ private fun MessageBubble(
     isPausedPlayback: Boolean,
     onPlayMessage: () -> Unit
 ) {
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
     val bubbleColor = when (message.senderType) {
         MessageSenderType.USER -> MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
         MessageSenderType.AGENT -> MaterialTheme.colorScheme.surface
@@ -824,13 +833,24 @@ private fun MessageBubble(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Top
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(message.senderName, style = MaterialTheme.typography.titleLarge)
-                    Text(
-                        message.senderRole,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                Row(
+                    modifier = Modifier.weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AgentAvatar(
+                        key = message.senderId,
+                        label = message.senderName,
+                        size = 44.dp
                     )
+                    Column {
+                        Text(message.senderName, style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            message.senderRole,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -842,6 +862,17 @@ private fun MessageBubble(
                             imageVector = Icons.Default.GraphicEq,
                             contentDescription = "Spoken",
                             tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(message.body))
+                            Toast.makeText(context, "Message copied", Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Copy full message"
                         )
                     }
                     IconButton(onClick = onPlayMessage) {
@@ -862,7 +893,9 @@ private fun MessageBubble(
                     }
                 }
             }
-            Text(message.body, style = MaterialTheme.typography.bodyLarge)
+            SelectionContainer {
+                Text(message.body, style = MaterialTheme.typography.bodyLarge)
+            }
             Text(
                 message.timestampLabel,
                 style = MaterialTheme.typography.labelMedium,

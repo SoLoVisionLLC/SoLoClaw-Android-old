@@ -68,6 +68,7 @@ class OpenClawViewModel(
     private val initialVoiceProfiles = voiceSettingsStore.readProfiles()
     private val initialAgentVoiceConfigs = agentVoiceConfigStore.read()
     private val initialThemeMode = appThemeStore.read()
+    private val initialSelectedRoomId = conversationDisplayStore.readLastOpenedRoomId()
     private val initialNotificationPermissionGranted = appNotificationManager?.hasPermission() ?: true
     private val initialNotificationSettings =
         notificationPreferencesStore.readSettings(initialNotificationPermissionGranted)
@@ -76,7 +77,7 @@ class OpenClawViewModel(
         AppUiState(
             agents = emptyList(),
             rooms = emptyList(),
-            selectedRoomId = null,
+            selectedRoomId = initialSelectedRoomId,
             roomMessages = emptyMap(),
             voiceSettings = initialVoiceSettings,
             ttsState = TtsState(
@@ -158,6 +159,7 @@ class OpenClawViewModel(
     }
 
     fun selectRoom(roomId: String) {
+        persistSelectedRoomId(roomId)
         _uiState.value = _uiState.value.copy(
             selectedRoomId = roomId,
             selectedRoomUnreadAnchorKey = null,
@@ -303,6 +305,7 @@ class OpenClawViewModel(
         val selectedRoomId = currentState.selectedRoomId
             ?.takeUnless { roomId -> isHiddenAgentRoom(roomId, hiddenAgentIds) }
             ?: firstVisibleRoomId(currentState.rooms, hiddenAgentIds)
+        persistSelectedRoomId(selectedRoomId)
 
         _uiState.value = currentState.copy(
             hiddenAgentIds = hiddenAgentIds,
@@ -343,6 +346,7 @@ class OpenClawViewModel(
                 val messages = repository.getRoomMessages(room.id)
                 Triple(room, rooms, messages)
             }.onSuccess { (room, rooms, messages) ->
+                persistSelectedRoomId(room.id)
                 _uiState.value = _uiState.value.copy(
                     rooms = rooms,
                     selectedRoomId = room.id,
@@ -380,6 +384,7 @@ class OpenClawViewModel(
                     ?.takeUnless { it == roomId }
                     ?.takeIf { current -> rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds) }
                     ?: firstVisibleRoomId(rooms, hiddenAgentIds)
+                persistSelectedRoomId(selectedRoomId)
                 _uiState.value = _uiState.value.copy(
                     rooms = applyUnreadCounts(rooms, updatedRoomMessages),
                     roomMessages = updatedRoomMessages,
@@ -1395,6 +1400,7 @@ class OpenClawViewModel(
                             rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds)
                         }
                         ?: firstVisibleRoomId(rooms, hiddenAgentIds)
+                    persistSelectedRoomId(selected)
                     _uiState.value = _uiState.value.copy(
                         rooms = applyUnreadCounts(rooms),
                         selectedRoomId = selected
@@ -1472,6 +1478,7 @@ class OpenClawViewModel(
         val selectedRoomId = _uiState.value.selectedRoomId
             ?.takeIf { current -> rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds) }
             ?: firstVisibleRoomId(rooms, hiddenAgentIds)
+        persistSelectedRoomId(selectedRoomId)
 
         _uiState.value = _uiState.value.copy(
             rooms = applyUnreadCounts(rooms, updatedRoomMessages),
@@ -1523,6 +1530,7 @@ class OpenClawViewModel(
         val notificationEligibleMessages = messages.filter { message ->
             message.senderType != MessageSenderType.USER && !message.internal
         }
+        if (!isAppInForeground) return
         val latestMessageKey = notificationEligibleMessages.lastOrNull()?.messageKey ?: return
         val lastNotifiedMessageKey = notificationPreferencesStore.readLastNotifiedMessageKey(room.id)
 
@@ -1544,10 +1552,11 @@ class OpenClawViewModel(
         if (!shouldDeliverMessageNotification(room.id)) return
         if (isAppInForeground && _uiState.value.selectedRoomId == room.id) return
 
-        appNotificationManager?.notifyNewMessage(room, newMessages.last(), newMessages.size)
+        appNotificationManager?.notifyNewMessages(room, newMessages)
     }
 
     private fun maybeNotifyForCronJob(job: CronJob) {
+        if (!isAppInForeground) return
         val signature = cronNotificationSignature(job) ?: return
         val lastSignature = notificationPreferencesStore.readLastNotifiedCronSignature(job.id)
         if (lastSignature == null) {
@@ -1797,6 +1806,10 @@ class OpenClawViewModel(
         hiddenAgentIds: Set<String>
     ): String? {
         return rooms.firstOrNull { room -> !isHiddenAgentRoom(room.id, hiddenAgentIds) }?.id
+    }
+
+    private fun persistSelectedRoomId(roomId: String?) {
+        conversationDisplayStore.writeLastOpenedRoomId(roomId)
     }
 
     private fun isHiddenAgentRoom(roomId: String, hiddenAgentIds: Set<String>): Boolean {

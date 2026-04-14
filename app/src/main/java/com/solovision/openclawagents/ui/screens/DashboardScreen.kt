@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import com.solovision.openclawagents.R
 import com.solovision.openclawagents.model.AppUiState
 import com.solovision.openclawagents.model.CollaborationRoom
+import com.solovision.openclawagents.ui.components.AgentAvatar
 
 @Composable
 fun DashboardScreen(
@@ -183,11 +184,11 @@ fun DashboardScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(14.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(agent.accent))
+                            AgentAvatar(
+                                key = agent.id,
+                                label = agent.name,
+                                accent = agent.accent,
+                                size = 44.dp
                             )
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(agent.name, style = MaterialTheme.typography.titleLarge)

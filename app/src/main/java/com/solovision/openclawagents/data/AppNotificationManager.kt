@@ -11,6 +11,7 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import com.solovision.openclawagents.AgentAvatarCatalog
 import com.solovision.openclawagents.MainActivity
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.CronJob
@@ -34,23 +35,36 @@ class AppNotificationManager(
             android.content.pm.PackageManager.PERMISSION_GRANTED
     }
 
-    fun notifyNewMessage(room: CollaborationRoom, message: RoomMessage, count: Int) {
+    fun notifyNewMessages(room: CollaborationRoom, messages: List<RoomMessage>) {
         if (!hasPermission()) return
-        val notification = NotificationCompat.Builder(context, MESSAGE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(room.title)
-            .setContentText(
-                if (count > 1) "${message.senderName}: ${message.body} (+${count - 1} more)"
-                else "${message.senderName}: ${message.body}"
-            )
-            .setStyle(NotificationCompat.BigTextStyle().bigText(message.body))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .setContentIntent(mainPendingIntent(room.id))
-            .build()
+        val latestBySender = messages
+            .groupBy { notificationSenderKey(it) }
+            .values
+            .mapNotNull { senderMessages -> senderMessages.lastOrNull()?.let { it to senderMessages.size } }
 
-        @SuppressLint("MissingPermission")
-        NotificationManagerCompat.from(context).notify(room.id.hashCode(), notification)
+        val notificationManager = NotificationManagerCompat.from(context)
+        notificationManager.cancel(legacyRoomNotificationId(room.id))
+        latestBySender.forEach { (message, count) ->
+            val notification = NotificationCompat.Builder(context, MESSAGE_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle(room.title)
+                .setContentText(
+                    if (count > 1) "${message.senderName}: ${message.body} (+${count - 1} more)"
+                    else "${message.senderName}: ${message.body}"
+                )
+                .setStyle(NotificationCompat.BigTextStyle().bigText(message.body))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(mainPendingIntent(room.id))
+                .setLargeIcon(
+                    AgentAvatarCatalog.bitmapForKey(context, message.senderId)
+                        ?: AgentAvatarCatalog.bitmapForKey(context, message.senderName)
+                )
+                .build()
+
+            @SuppressLint("MissingPermission")
+            notificationManager.notify(senderNotificationId(room.id, message), notification)
+        }
     }
 
     fun notifyCronUpdate(job: CronJob) {
@@ -75,6 +89,10 @@ class AppNotificationManager(
             )
             .setAutoCancel(true)
             .setContentIntent(mainPendingIntent("cron:${job.id}"))
+            .setLargeIcon(
+                AgentAvatarCatalog.bitmapForKey(context, job.agentId)
+                    ?: AgentAvatarCatalog.bitmapForKey(context, job.sessionTarget)
+            )
             .build()
 
         @SuppressLint("MissingPermission")
@@ -95,8 +113,11 @@ class AppNotificationManager(
 
     private fun mainPendingIntent(target: String): PendingIntent {
         val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra("notification_target", target)
+            flags =
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_NOTIFICATION_TARGET, target)
         }
         return PendingIntent.getActivity(
             context,
@@ -131,5 +152,17 @@ class AppNotificationManager(
             description = "Persistent service notification for always-on monitoring."
         }
         manager.createNotificationChannels(listOf(messageChannel, cronChannel, backgroundSyncChannel))
+    }
+
+    private fun notificationSenderKey(message: RoomMessage): String {
+        return message.senderId.ifBlank { message.senderName.ifBlank { message.id } }
+    }
+
+    private fun senderNotificationId(roomId: String, message: RoomMessage): Int {
+        return "$roomId:${notificationSenderKey(message)}".hashCode()
+    }
+
+    private fun legacyRoomNotificationId(roomId: String): Int {
+        return roomId.hashCode()
     }
 }
