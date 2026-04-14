@@ -45,6 +45,15 @@ fun AgentsScreen(
 ) {
     var agentConfigTarget by remember { mutableStateOf<Agent?>(null) }
     val visibleAgents = uiState.agents.filterNot { uiState.hiddenAgentIds.contains(it.id) }
+    val agentUnreadCounts = remember(uiState.agents, uiState.rooms) {
+        uiState.agents.associate { agent ->
+            val room = uiState.rooms.find { room ->
+                room.id.equals("agent:${agent.id}:main", ignoreCase = true) ||
+                (room.id.startsWith("agent:") && room.id.removePrefix("agent:").substringBefore(':').equals(agent.id, ignoreCase = true))
+            }
+            agent.id to (room?.unreadCount ?: 0)
+        }
+    }
 
     if (uiState.managingAgents) {
         ManageAgentsDialog(
@@ -139,6 +148,7 @@ fun AgentsScreen(
             item {
                 ReorderableAgentList(
                     agents = visibleAgents,
+                    unreadCounts = agentUnreadCounts,
                     voiceConfigs = uiState.agentVoiceConfigs,
                     onMoveAgent = onMoveAgent,
                     onOpenAgent = onOpenAgent,

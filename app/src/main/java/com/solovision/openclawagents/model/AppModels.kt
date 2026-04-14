@@ -102,8 +102,7 @@ data class RoomMessage(
     val timestampLabel: String,
     val spoken: Boolean = false,
     val internal: Boolean = false,
-    val messageKey: String = id,
-    val timestampMs: Long? = null
+    val messageKey: String = id
 )
 
 data class TtsState(

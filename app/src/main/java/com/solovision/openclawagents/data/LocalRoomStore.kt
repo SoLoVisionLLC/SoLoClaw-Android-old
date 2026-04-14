@@ -138,12 +138,7 @@ class LocalRoomStore private constructor(
                                 timestampLabel = message.optString("timestampLabel", "Now"),
                                 spoken = message.optBoolean("spoken", false),
                                 internal = message.optBoolean("internal", false),
-                                messageKey = message.optString("messageKey").ifBlank { message.optString("id") },
-                                timestampMs = if (message.has("timestampMs") && !message.isNull("timestampMs")) {
-                                    message.optLong("timestampMs")
-                                } else {
-                                    null
-                                }
+                                messageKey = message.optString("messageKey").ifBlank { message.optString("id") }
                             )
                         )
                     }
@@ -221,7 +216,6 @@ class LocalRoomStore private constructor(
             put("spoken", spoken)
             put("internal", internal)
             put("messageKey", messageKey)
-            put("timestampMs", timestampMs)
         }
     }
 }

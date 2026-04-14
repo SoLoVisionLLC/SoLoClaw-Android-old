@@ -146,19 +146,41 @@ class OpenClawViewModel(
     }
 
     fun openAgentRoom(agentId: String): String {
+        Log.d(logTag, "openAgentRoom(agentId=$agentId)")
         val mainRoomId = "agent:$agentId:main"
-        val roomId = _uiState.value.rooms
+        val existingRoomId = _uiState.value.rooms
             .firstOrNull { it.id.equals(mainRoomId, ignoreCase = true) }
             ?.id
             ?: _uiState.value.rooms
             .firstOrNull { isDirectSessionRoomForAgent(it.id, agentId) }
             ?.id
-            ?: mainRoomId
+            
+        val roomId = existingRoomId ?: mainRoomId
+        
+        if (existingRoomId == null) {
+            val agent = _uiState.value.agents.firstOrNull { it.id.equals(agentId, ignoreCase = true) }
+            val syntheticRoom = CollaborationRoom(
+                id = mainRoomId,
+                title = agent?.name ?: agentId,
+                purpose = "Direct chat with ${agent?.name ?: agentId}",
+                members = listOf(agentId),
+                unreadCount = 0,
+                active = true,
+                lastActivity = "Live",
+                sessionLabel = "Halo"
+            )
+            _uiState.value = _uiState.value.copy(
+                rooms = (_uiState.value.rooms + syntheticRoom).distinctBy { it.id }
+            )
+        }
+        
+        Log.d(logTag, "openAgentRoom: resolved to roomId=$roomId")
         selectRoom(roomId)
         return roomId
     }
 
     fun selectRoom(roomId: String) {
+        Log.d(logTag, "selectRoom(roomId=$roomId)")
         persistSelectedRoomId(roomId)
         _uiState.value = _uiState.value.copy(
             selectedRoomId = roomId,
@@ -423,10 +445,8 @@ class OpenClawViewModel(
                 messageKey = buildLocalMessageKey(
                     roomId = roomId,
                     senderType = MessageSenderType.USER,
-                    body = text,
-                    timestampMs = System.currentTimeMillis()
-                ),
-                timestampMs = System.currentTimeMillis()
+                    body = text
+                )
             )
             _uiState.value = _uiState.value.copy(
                 draftMessage = "",
@@ -1395,14 +1415,33 @@ class OpenClawViewModel(
             runCatching { repository.getRooms() }
                 .onSuccess { rooms ->
                     val hiddenAgentIds = _uiState.value.hiddenAgentIds
-                    val selected = _uiState.value.selectedRoomId
+                    val currentSelection = _uiState.value.selectedRoomId
+                    val isAgentRoom = currentSelection?.startsWith("agent:") == true
+                    
+                    val selected = currentSelection
                         ?.takeIf { current ->
-                            rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds)
+                            val exists = rooms.any { it.id == current }
+                            val isHidden = isHiddenAgentRoom(current, hiddenAgentIds)
+                            exists && !isHidden
                         }
-                        ?: firstVisibleRoomId(rooms, hiddenAgentIds)
+                        ?: if (isAgentRoom && currentSelection != null) {
+                            Log.d(logTag, "refreshRooms: keeping agent room selection $currentSelection even if not in fresh room list")
+                            currentSelection
+                        } else {
+                            firstVisibleRoomId(rooms, hiddenAgentIds)
+                        }
+
+                    val finalRooms = if (isAgentRoom && currentSelection != null && rooms.none { it.id == currentSelection }) {
+                        val currentRoomObj = _uiState.value.rooms.firstOrNull { it.id == currentSelection }
+                        if (currentRoomObj != null) rooms + currentRoomObj else rooms
+                    } else {
+                        rooms
+                    }
+
+                    Log.d(logTag, "refreshRooms: currentSelection=$currentSelection, selected=$selected, roomCount=${rooms.size}")
                     persistSelectedRoomId(selected)
                     _uiState.value = _uiState.value.copy(
-                        rooms = applyUnreadCounts(rooms),
+                        rooms = applyUnreadCounts(finalRooms),
                         selectedRoomId = selected
                     )
                     selected?.let(::refreshMessages)
@@ -1475,13 +1514,27 @@ class OpenClawViewModel(
         }
 
         val hiddenAgentIds = _uiState.value.hiddenAgentIds
-        val selectedRoomId = _uiState.value.selectedRoomId
-            ?.takeIf { current -> rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds) }
-            ?: firstVisibleRoomId(rooms, hiddenAgentIds)
+        val currentSelection = _uiState.value.selectedRoomId
+        val isAgentRoom = currentSelection?.startsWith("agent:") == true
+        
+        val selectedRoomId = currentSelection
+            ?.takeIf { current ->
+                rooms.any { it.id == current } && !isHiddenAgentRoom(current, hiddenAgentIds)
+            }
+            ?: if (isAgentRoom && currentSelection != null) currentSelection else firstVisibleRoomId(rooms, hiddenAgentIds)
+
+        val finalRooms = if (isAgentRoom && currentSelection != null && rooms.none { it.id == currentSelection }) {
+            val currentRoomObj = _uiState.value.rooms.firstOrNull { it.id == currentSelection }
+            if (currentRoomObj != null) rooms + currentRoomObj else rooms
+        } else {
+            rooms
+        }
+
+        Log.d(logTag, "pollRoomsForNotifications: currentSelection=$currentSelection, finalSelection=$selectedRoomId")
         persistSelectedRoomId(selectedRoomId)
 
         _uiState.value = _uiState.value.copy(
-            rooms = applyUnreadCounts(rooms, updatedRoomMessages),
+            rooms = applyUnreadCounts(finalRooms, updatedRoomMessages),
             roomMessages = updatedRoomMessages,
             selectedRoomId = selectedRoomId
         )
@@ -1794,10 +1847,9 @@ class OpenClawViewModel(
     private fun buildLocalMessageKey(
         roomId: String,
         senderType: MessageSenderType,
-        body: String,
-        timestampMs: Long
+        body: String
     ): String {
-        return listOf(roomId, senderType.name.lowercase(), timestampMs.toString(), body.trim())
+        return listOf(roomId, senderType.name.lowercase(), System.currentTimeMillis().toString(), body.trim())
             .joinToString("|")
     }
 

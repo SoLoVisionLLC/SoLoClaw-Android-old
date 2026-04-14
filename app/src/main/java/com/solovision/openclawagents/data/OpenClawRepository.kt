@@ -91,8 +91,7 @@ class FakeOpenClawRepository : OpenClawRepository {
             body = text,
             timestampLabel = "Now",
             internal = false,
-            messageKey = buildMessageKey("user", "solo", text, timestampMs),
-            timestampMs = timestampMs
+            messageKey = buildMessageKey("user", "solo", text)
         )
     }
 
@@ -118,8 +117,7 @@ class FakeOpenClawRepository : OpenClawRepository {
                 body = "Room created with ${agentIds.size} agents.",
                 timestampLabel = "Now",
                 internal = true,
-                messageKey = buildMessageKey("system", "system", "Room created with ${agentIds.size} agents.", timestampMs),
-                timestampMs = timestampMs
+                messageKey = buildMessageKey("system", "system", "Room created with ${agentIds.size} agents.")
             )
         )
         return room
@@ -317,8 +315,7 @@ class GatewayRpcOpenClawTransport(
                     body = request.text,
                     timestampLabel = "Now",
                     internal = false,
-                    messageKey = buildMessageKey("user", "solo", request.text, userTimestampMs),
-                    timestampMs = userTimestampMs
+                    messageKey = buildMessageKey("user", "solo", request.text)
                 )
 
                 val targetAgentIds = resolveLocalRoomTargets(localRoom, roomMessages, request.text)
@@ -336,10 +333,8 @@ class GatewayRpcOpenClawTransport(
                         messageKey = buildMessageKey(
                             "system",
                             "system",
-                            "No agent was targeted. In group rooms, use @agent-name for one agent or @all for the full room.",
-                            systemTimestampMs
-                        ),
-                        timestampMs = systemTimestampMs
+                            "No agent was targeted. In group rooms, use @agent-name for one agent or @all for the full room."
+                        )
                     )
                     persistLocalRooms()
                     return@withContext
@@ -385,10 +380,8 @@ class GatewayRpcOpenClawTransport(
                         messageKey = buildMessageKey(
                             "system",
                             "system",
-                            "Could not reach: ${failedAgents.joinToString(", ")}",
-                            systemTimestampMs
-                        ),
-                        timestampMs = systemTimestampMs
+                            "Could not reach: ${failedAgents.joinToString(", ")}"
+                        )
                     )
                 }
 
@@ -441,10 +434,8 @@ class GatewayRpcOpenClawTransport(
                 messageKey = buildMessageKey(
                     "system",
                     "system",
-                    "Room created for ${room.members.joinToString(", ")}. Use @agent-name to target one agent, or @all to broadcast to the full room. Messages will be relayed into room-specific agent sessions for ${room.title}.",
-                    timestampMs
-                ),
-                timestampMs = timestampMs
+                    "Room created for ${room.members.joinToString(", ")}. Use @agent-name to target one agent, or @all to broadcast to the full room. Messages will be relayed into room-specific agent sessions for ${room.title}."
+                )
             )
         )
         localRoomReplyCursor[room.id] = memberSessionKeys.mapValues { (_, sessionKey) ->
@@ -562,7 +553,7 @@ class GatewayRpcOpenClawTransport(
                 "assistant" -> agentIdFromSessionKey(roomId)
                 else -> "system"
             }
-            val messageKey = buildMessageKey(role, senderId, content, timestampMs ?: index.toLong())
+            val messageKey = buildMessageKey(role, senderId, content)
             val internal = isInternalHistoryMessage(role, content, message)
 
             when (role) {
@@ -575,8 +566,7 @@ class GatewayRpcOpenClawTransport(
                     body = content,
                     timestampLabel = formatTimestampLabel(timestampMs),
                     internal = internal,
-                    messageKey = messageKey,
-                    timestampMs = timestampMs
+                    messageKey = messageKey
                 )
 
                 "assistant" -> RoomMessage(
@@ -588,8 +578,7 @@ class GatewayRpcOpenClawTransport(
                     body = content,
                     timestampLabel = formatTimestampLabel(timestampMs),
                     internal = internal,
-                    messageKey = messageKey,
-                    timestampMs = timestampMs
+                    messageKey = messageKey
                 )
 
                 else -> RoomMessage(
@@ -601,8 +590,7 @@ class GatewayRpcOpenClawTransport(
                     body = content,
                     timestampLabel = formatTimestampLabel(timestampMs),
                     internal = internal,
-                    messageKey = messageKey,
-                    timestampMs = timestampMs
+                    messageKey = messageKey
                 )
             }
         }
@@ -1518,8 +1506,8 @@ private fun escapeJson(value: String): String {
 
 private fun String.ensureLeadingSlash(): String = if (startsWith('/')) this else "/$this"
 
-private fun buildMessageKey(role: String, senderId: String, body: String, timestampMs: Long): String {
-    val normalized = listOf(role.trim().lowercase(), senderId.trim().lowercase(), timestampMs.toString(), body.trim())
+private fun buildMessageKey(role: String, senderId: String, body: String): String {
+    val normalized = listOf(role.trim().lowercase(), senderId.trim().lowercase(), body.trim())
         .joinToString("|")
     val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
     val fingerprint = digest.joinToString("") { "%02x".format(it) }.take(16)
