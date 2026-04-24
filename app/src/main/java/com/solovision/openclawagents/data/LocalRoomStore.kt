@@ -117,7 +117,11 @@ class LocalRoomStore private constructor(
                         id = room.optString("id"),
                         title = room.optString("title"),
                         purpose = room.optString("purpose"),
-                        members = room.optJSONArray("members").toStringList(),
+                        members = when {
+                            room.has("memberIds") -> room.optJSONArray("memberIds").toStringList()
+                            room.has("members") -> room.optJSONArray("members").toStringList()
+                            else -> emptyList()
+                        },
                         unreadCount = room.optInt("unreadCount", 0),
                         active = room.optBoolean("active", true),
                         voiceMode = room.optString("voiceMode")
@@ -216,12 +220,15 @@ class LocalRoomStore private constructor(
             put("id", id)
             put("title", title)
             put("purpose", purpose)
-            put("members", JSONArray().apply { members.forEach(::put) })
+            put("memberIds", JSONArray().apply { members.forEach(::put) })
+            put("members", JSONArray().apply { members.forEach(::put) }) // backward compat
             put("unreadCount", unreadCount)
             put("active", active)
             put("voiceMode", voiceMode.name)
             put("lastActivity", lastActivity)
             put("sessionLabel", sessionLabel)
+            put("createdAt", System.currentTimeMillis())
+            put("isLocal", true)
         }
     }
 
