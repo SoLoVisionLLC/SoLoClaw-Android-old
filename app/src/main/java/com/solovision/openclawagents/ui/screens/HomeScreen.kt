@@ -59,6 +59,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.solovision.openclawagents.model.Agent
@@ -67,6 +68,7 @@ import com.solovision.openclawagents.model.AppUiState
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.VoiceOption
 import com.solovision.openclawagents.model.VoiceProvider
+import com.solovision.openclawagents.ui.components.AgentAvatar
 
 @Composable
 fun HomeScreenContent(
@@ -142,6 +144,16 @@ fun HomeScreenContent(
         )
     }
 
+    val agentUnreadCounts = remember(uiState.agents, uiState.rooms) {
+        uiState.agents.associate { agent ->
+            val room = uiState.rooms.find { room ->
+                room.id.equals("agent:${agent.id}:main", ignoreCase = true) ||
+                (room.id.startsWith("agent:") && room.id.removePrefix("agent:").substringBefore(':').equals(agent.id, ignoreCase = true))
+            }
+            agent.id to (room?.unreadCount ?: 0)
+        }
+    }
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         floatingActionButton = {
@@ -188,6 +200,7 @@ fun HomeScreenContent(
                 item {
                     ReorderableAgentList(
                         agents = visibleAgents,
+                        unreadCounts = agentUnreadCounts,
                         voiceConfigs = uiState.agentVoiceConfigs,
                         onMoveAgent = onMoveAgent,
                         onOpenAgent = onOpenAgent,
@@ -219,8 +232,9 @@ fun HomeScreenContent(
 }
 
 @Composable
-private fun ReorderableAgentList(
+internal fun ReorderableAgentList(
     agents: List<Agent>,
+    unreadCounts: Map<String, Int>,
     voiceConfigs: Map<String, AgentVoiceConfig>,
     onMoveAgent: (String, String) -> Unit,
     onOpenAgent: (String) -> Unit,
@@ -278,6 +292,7 @@ private fun ReorderableAgentList(
             ) {
                 AgentCard(
                     agent = agent,
+                    unreadCount = unreadCounts[agent.id] ?: 0,
                     voiceConfig = voiceConfigs[agent.id],
                     onOpen = { onOpenAgent(agent.id) },
                     onConfigureVoice = { onConfigureVoice(agent) }
@@ -288,7 +303,7 @@ private fun ReorderableAgentList(
 }
 
 @Composable
-private fun CreateRoomDialog(
+internal fun CreateRoomDialog(
     uiState: AppUiState,
     onDismiss: () -> Unit,
     onUpdateRoomTitle: (String) -> Unit,
@@ -380,7 +395,7 @@ private fun CreateRoomDialog(
 }
 
 @Composable
-private fun ManageAgentsDialog(
+internal fun ManageAgentsDialog(
     uiState: AppUiState,
     onDismiss: () -> Unit,
     onSetAgentHidden: (String, Boolean) -> Unit
@@ -523,6 +538,7 @@ private fun SectionHeader(
 @Composable
 private fun AgentCard(
     agent: Agent,
+    unreadCount: Int,
     voiceConfig: AgentVoiceConfig?,
     onOpen: () -> Unit,
     onConfigureVoice: () -> Unit
@@ -545,15 +561,25 @@ private fun AgentCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(14.dp)
-                            .clip(CircleShape)
-                            .background(Color(agent.accent))
+                    AgentAvatar(
+                        key = agent.id,
+                        label = agent.name,
+                        accent = agent.accent,
+                        size = 44.dp
                     )
                     Spacer(modifier = Modifier.size(12.dp))
                     Column {
-                        Text(agent.name, style = MaterialTheme.typography.titleLarge)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(agent.name, style = MaterialTheme.typography.titleLarge)
+                            if (unreadCount > 0) {
+                                Text(
+                                    "• $unreadCount new",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Color(0xFFFB7185),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                         Text(
                             agent.role,
                             style = MaterialTheme.typography.bodyMedium,
@@ -597,7 +623,7 @@ private data class ItemBounds(
 }
 
 @Composable
-private fun AgentVoiceConfigDialog(
+internal fun AgentVoiceConfigDialog(
     agent: Agent,
     config: AgentVoiceConfig,
     availableVoices: List<VoiceOption>,
@@ -684,7 +710,7 @@ private fun AgentVoiceConfigDialog(
 }
 
 @Composable
-private fun RoomCard(
+internal fun RoomCard(
     room: CollaborationRoom,
     onOpenRoom: () -> Unit,
     onDeleteRoom: (() -> Unit)?
@@ -734,7 +760,7 @@ private fun RoomCard(
 }
 
 @Composable
-private fun DeleteRoomDialog(
+internal fun DeleteRoomDialog(
     room: CollaborationRoom,
     onDismiss: () -> Unit,
     onConfirmDelete: () -> Unit

@@ -1,5 +1,6 @@
 package com.solovision.openclawagents.ui.screens
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,6 +21,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Campaign
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
@@ -55,6 +58,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -62,6 +68,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.text.selection.SelectionContainer
 import com.solovision.openclawagents.model.AppUiState
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
@@ -70,6 +77,7 @@ import com.solovision.openclawagents.model.VoiceOption
 import com.solovision.openclawagents.model.VoiceProfile
 import com.solovision.openclawagents.model.VoiceProvider
 import com.solovision.openclawagents.model.VoiceSettings
+import com.solovision.openclawagents.ui.components.AgentAvatar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -137,7 +145,7 @@ fun RoomScreen(
 
     if (confirmDeleteSession && room != null) {
         DeleteSessionDialog(
-            sessionLabel = room.sessionLabel ?: "Session",
+            sessionLabel = displaySessionLabel(room.sessionLabel),
             onDismiss = { confirmDeleteSession = false },
             onConfirmDelete = {
                 confirmDeleteSession = false
@@ -237,7 +245,7 @@ fun RoomScreen(
                     if (room != null && directSessions.isNotEmpty()) {
                         Box {
                             TextButton(onClick = { sessionsExpanded = true }) {
-                                Text(room.sessionLabel ?: "Main")
+                                Text(displaySessionLabel(room.sessionLabel))
                                 Icon(
                                     imageVector = Icons.Default.ArrowDropDown,
                                     contentDescription = "Change session"
@@ -251,7 +259,7 @@ fun RoomScreen(
                                     DropdownMenuItem(
                                         text = {
                                             Column {
-                                                Text(session.sessionLabel ?: "Main")
+                                                Text(displaySessionLabel(session.sessionLabel))
                                                 Text(
                                                     session.lastActivity,
                                                     style = MaterialTheme.typography.labelSmall,
@@ -324,6 +332,15 @@ fun RoomScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            room?.let { activeRoom ->
+                item {
+                    RoomOverviewCard(
+                        room = activeRoom,
+                        visibleMessageCount = visibleMessages.size,
+                        showingInternalMessages = uiState.showInternalMessages
+                    )
+                }
+            }
             if (uiState.isWorking || uiState.errorMessage != null) {
                 item {
                     StatusBanner(
@@ -367,10 +384,18 @@ private fun isDeletableDirectSessionKey(roomId: String): Boolean {
 private fun roomSubtitle(room: CollaborationRoom?, directSessions: List<CollaborationRoom>): String {
     if (room == null) return "No room selected"
     return when {
-        room.id.startsWith("agent:") && directSessions.size > 1 -> "Session: ${room.sessionLabel ?: "Main"}"
+        room.id.startsWith("agent:") && directSessions.size > 1 -> "Session: ${displaySessionLabel(room.sessionLabel)}"
         room.id.startsWith("agent:") -> room.purpose
         room.members.isNotEmpty() -> room.members.joinToString(" | ")
         else -> room.purpose
+    }
+}
+
+private fun displaySessionLabel(sessionLabel: String?): String {
+    return when {
+        sessionLabel.isNullOrBlank() -> "Halo"
+        sessionLabel.equals("main", ignoreCase = true) -> "Halo"
+        else -> sessionLabel
     }
 }
 
@@ -787,8 +812,10 @@ private fun MessageBubble(
     isPausedPlayback: Boolean,
     onPlayMessage: () -> Unit
 ) {
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
     val bubbleColor = when (message.senderType) {
-        MessageSenderType.USER -> MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+        MessageSenderType.USER -> MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
         MessageSenderType.AGENT -> MaterialTheme.colorScheme.surface
         MessageSenderType.SYSTEM -> MaterialTheme.colorScheme.surfaceVariant
     }
@@ -806,23 +833,46 @@ private fun MessageBubble(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Top
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(message.senderName, style = MaterialTheme.typography.titleLarge)
-                    Text(
-                        message.senderRole,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                Row(
+                    modifier = Modifier.weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AgentAvatar(
+                        key = message.senderId,
+                        label = message.senderName,
+                        size = 44.dp
                     )
+                    Column {
+                        Text(message.senderName, style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            message.senderRole,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    SpeakerChip(message.senderType)
                     if (message.spoken) {
                         Icon(
                             imageVector = Icons.Default.GraphicEq,
                             contentDescription = "Spoken",
                             tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(message.body))
+                            Toast.makeText(context, "Message copied", Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Copy full message"
                         )
                     }
                     IconButton(onClick = onPlayMessage) {
@@ -843,7 +893,9 @@ private fun MessageBubble(
                     }
                 }
             }
-            Text(message.body, style = MaterialTheme.typography.bodyLarge)
+            SelectionContainer {
+                Text(message.body, style = MaterialTheme.typography.bodyLarge)
+            }
             Text(
                 message.timestampLabel,
                 style = MaterialTheme.typography.labelMedium,
@@ -869,37 +921,50 @@ private fun ComposerBar(
         shape = RoundedCornerShape(28.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
-        Row(
+        Column(
             modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier.weight(1f),
-                placeholder = {
-                    Text(
-                        if (roomTitle.isNullOrBlank()) {
-                            "Send a message"
-                        } else {
-                            "Message $roomTitle"
-                        }
-                    )
+            Text(
+                text = if (roomTitle.isNullOrBlank()) {
+                    "Mission channel"
+                } else {
+                    "Live in $roomTitle"
                 },
-                shape = RoundedCornerShape(18.dp)
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Box(
-                modifier = Modifier
-                    .background(Color(0xFF7C5CFF), RoundedCornerShape(18.dp))
-                    .padding(4.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                IconButton(onClick = onSend) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send",
-                        tint = Color.White
-                    )
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = {
+                        Text(
+                            if (roomTitle.isNullOrBlank()) {
+                                "Send a message"
+                            } else {
+                                "Message $roomTitle"
+                            }
+                        )
+                    },
+                    shape = RoundedCornerShape(18.dp)
+                )
+                Box(
+                    modifier = Modifier
+                        .background(Color(0xFF7C5CFF), RoundedCornerShape(18.dp))
+                        .padding(4.dp)
+                ) {
+                    IconButton(onClick = onSend) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Send",
+                            tint = Color.White
+                        )
+                    }
                 }
             }
         }
@@ -934,6 +999,72 @@ private fun StatusBanner(message: String, isError: Boolean) {
             modifier = Modifier.padding(16.dp),
             style = MaterialTheme.typography.bodyMedium,
             color = if (isError) Color(0xFFFFD7DE) else MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+@Composable
+private fun RoomOverviewCard(
+    room: CollaborationRoom,
+    visibleMessageCount: Int,
+    showingInternalMessages: Boolean
+) {
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(room.title, style = MaterialTheme.typography.titleLarge)
+            Text(
+                room.purpose,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                VoiceActionChip(
+                    icon = Icons.Default.Campaign,
+                    label = "${room.members.size} agents"
+                )
+                VoiceActionChip(
+                    icon = Icons.Default.PlayArrow,
+                    label = "$visibleMessageCount visible"
+                )
+                VoiceActionChip(
+                    icon = if (showingInternalMessages) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                    label = if (showingInternalMessages) "Details on" else "Details off"
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SpeakerChip(senderType: MessageSenderType) {
+    val label = when (senderType) {
+        MessageSenderType.USER -> "Operator"
+        MessageSenderType.AGENT -> "Agent"
+        MessageSenderType.SYSTEM -> "System"
+    }
+    val tone = when (senderType) {
+        MessageSenderType.USER -> MaterialTheme.colorScheme.primary
+        MessageSenderType.AGENT -> MaterialTheme.colorScheme.secondary
+        MessageSenderType.SYSTEM -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Card(
+        shape = RoundedCornerShape(999.dp),
+        colors = CardDefaults.cardColors(containerColor = tone.copy(alpha = 0.16f))
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = tone
         )
     }
 }

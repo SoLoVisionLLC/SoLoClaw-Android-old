@@ -1,109 +1,330 @@
 package com.solovision.openclawagents.ui
 
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.navigation.NavDestination.Companion.hierarchy
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navOptions
+import com.solovision.openclawagents.BackgroundSyncService
 import com.solovision.openclawagents.OpenClawViewModel
-import com.solovision.openclawagents.ui.screens.HomeScreen
+import com.solovision.openclawagents.ui.screens.AgentsScreen
+import com.solovision.openclawagents.ui.screens.CronScreen
+import com.solovision.openclawagents.ui.screens.DashboardScreen
 import com.solovision.openclawagents.ui.screens.RoomScreen
 import com.solovision.openclawagents.ui.screens.SettingsScreen
+import com.solovision.openclawagents.ui.screens.SkillsScreen
+import com.solovision.openclawagents.ui.theme.OpenClawAgentsTheme
 
 @Composable
-fun OpenClawAgentsApp() {
+fun OpenClawAgentsApp(
+    notificationTarget: String? = null,
+    onNotificationTargetConsumed: (String) -> Unit = {}
+) {
     val navController = rememberNavController()
     val context = LocalContext.current.applicationContext
     val viewModel: OpenClawViewModel = viewModel(factory = OpenClawViewModel.factory(context))
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsState()
-
-    NavHost(
-        navController = navController,
-        startDestination = "home"
+    val latestNotifications by rememberUpdatedState(uiState.notifications)
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentDestination = navBackStackEntry?.destination
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
     ) {
-        composable("home") {
-            HomeScreen(
-                uiState = uiState,
-                onCreateRoom = { viewModel.toggleCreateRoom(true) },
-                onDismissCreateRoom = { viewModel.toggleCreateRoom(false) },
-                onManageAgents = { viewModel.toggleManageAgents(true) },
-                onDismissManageAgents = { viewModel.toggleManageAgents(false) },
-                onUpdateRoomTitle = viewModel::updateNewRoomTitle,
-                onUpdateRoomPurpose = viewModel::updateNewRoomPurpose,
-                onToggleAgent = viewModel::toggleAgentSelection,
-                onSetAgentHidden = viewModel::setAgentHidden,
-                onMoveAgent = viewModel::moveAgent,
-                onSetAgentVoiceProvider = viewModel::setAgentVoiceProvider,
-                onSelectAgentVoice = viewModel::selectAgentVoice,
-                onLoadVoiceOptionsForProvider = viewModel::refreshVoiceOptionsForProvider,
-                onConfirmCreateRoom = {
-                    viewModel.createRoom { roomId ->
-                        viewModel.selectRoom(roomId)
-                        navController.navigate("room")
+        viewModel.refreshNotificationPermission()
+    }
+
+    LaunchedEffect(uiState.notifications.backgroundSyncEnabled, uiState.notifications.enabled) {
+        if (!uiState.notifications.backgroundSyncEnabled || !uiState.notifications.enabled) {
+            context.stopService(BackgroundSyncService.stopIntent(context))
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    viewModel.setAppInForeground(true)
+                    context.stopService(BackgroundSyncService.stopIntent(context))
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    viewModel.setAppInForeground(false)
+                    if (
+                        latestNotifications.enabled &&
+                        latestNotifications.backgroundSyncEnabled &&
+                        latestNotifications.permissionGranted
+                    ) {
+                        ContextCompat.startForegroundService(context, BackgroundSyncService.startIntent(context))
                     }
-                },
-                onDeleteRoom = viewModel::deleteRoom,
-                onOpenAgent = { agentId ->
-                    viewModel.openAgentRoom(agentId)
-                    navController.navigate("room")
-                },
-                onOpenRoom = { roomId ->
-                    viewModel.selectRoom(roomId)
-                    navController.navigate("room")
-                },
-                onOpenSettings = { navController.navigate("settings") }
-            )
+                }
+                else -> Unit
+            }
         }
-        composable("room") {
-            RoomScreen(
-                uiState = uiState,
-                onBack = { navController.popBackStack() },
-                onDraftChange = viewModel::updateDraft,
-                onSend = viewModel::sendCurrentMessage,
-                onSelectSession = { roomId -> viewModel.selectRoom(roomId) },
-                onDeleteSession = viewModel::deleteRoom,
-                onToggleVoiceSettings = viewModel::toggleVoiceSettings,
-                onSetVoiceProvider = viewModel::setVoiceProvider,
-                onUpdateCartesiaApiKey = viewModel::updateCartesiaApiKey,
-                onUpdateCartesiaModelId = viewModel::updateCartesiaModelId,
-                onRefreshVoiceOptions = viewModel::refreshVoiceOptions,
-                onSelectCartesiaVoice = viewModel::selectCartesiaVoice,
-                onUpdateKokoroEndpoint = viewModel::updateKokoroEndpoint,
-                onUpdateKokoroApiKey = viewModel::updateKokoroApiKey,
-                onUpdateKokoroModel = viewModel::updateKokoroModel,
-                onUpdateKokoroVoice = viewModel::updateKokoroVoice,
-                onUpdateLemonfoxApiKey = viewModel::updateLemonfoxApiKey,
-                onUpdateLemonfoxLanguage = viewModel::updateLemonfoxLanguage,
-                onUpdateLemonfoxSpeed = viewModel::updateLemonfoxSpeed,
-                onSelectLemonfoxVoice = viewModel::selectLemonfoxVoice,
-                onSaveVoiceProfile = viewModel::saveCurrentVoiceProfile,
-                onApplyVoiceProfile = viewModel::applyVoiceProfile,
-                onDeleteVoiceProfile = viewModel::deleteVoiceProfile,
-                onTestVoice = viewModel::testVoiceSample,
-                onPlayLatestMessage = viewModel::playLatestMessage,
-                onPlayMessage = viewModel::playMessage,
-                onStopPlayback = viewModel::stopPlayback,
-                onToggleInternalMessages = viewModel::setShowInternalMessages,
-                onStartPolling = viewModel::startSelectedRoomPolling,
-                onStopPolling = viewModel::stopSelectedRoomPolling
-            )
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
         }
-        composable("settings") {
-            SettingsScreen(
-                uiState = uiState,
-                onBack = { navController.popBackStack() },
-                onUpdateCartesiaApiKey = viewModel::updateCartesiaApiKey,
-                onUpdateCartesiaModelId = viewModel::updateCartesiaModelId,
-                onUpdateKokoroEndpoint = viewModel::updateKokoroEndpoint,
-                onUpdateKokoroApiKey = viewModel::updateKokoroApiKey,
-                onUpdateKokoroModel = viewModel::updateKokoroModel,
-                onUpdateLemonfoxApiKey = viewModel::updateLemonfoxApiKey,
-                onUpdateLemonfoxLanguage = viewModel::updateLemonfoxLanguage,
-                onUpdateLemonfoxSpeed = viewModel::updateLemonfoxSpeed
-            )
+    }
+
+    fun navigateToShellDestination(destination: AppDestination) {
+        val options = navOptions {
+            launchSingleTop = true
+            restoreState = true
+            popUpTo(navController.graph.startDestinationId) {
+                saveState = true
+            }
+        }
+        navController.navigate(destination.route, options)
+    }
+
+    fun openChat(roomId: String? = uiState.selectedRoomId ?: uiState.rooms.firstOrNull()?.id) {
+        roomId?.let(viewModel::selectRoom)
+        navigateToShellDestination(AppDestination.Chat)
+    }
+
+    LaunchedEffect(notificationTarget, uiState.rooms) {
+        val target = notificationTarget ?: return@LaunchedEffect
+        when {
+            target == AppDestination.Dashboard.route -> {
+                navigateToShellDestination(AppDestination.Dashboard)
+                onNotificationTargetConsumed(target)
+            }
+            target.startsWith("cron:") -> {
+                navigateToShellDestination(AppDestination.Cron)
+                onNotificationTargetConsumed(target)
+            }
+            uiState.rooms.any { it.id == target } -> {
+                openChat(target)
+                onNotificationTargetConsumed(target)
+            }
+            uiState.rooms.isNotEmpty() -> {
+                onNotificationTargetConsumed(target)
+            }
+        }
+    }
+
+    OpenClawAgentsTheme(themeMode = uiState.themeMode) {
+        Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
+            bottomBar = {
+                NavigationBar(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 0.dp
+                ) {
+                    primaryDestinations.forEach { destination ->
+                        val selected = currentDestination
+                            ?.hierarchy
+                            ?.any { it.route == destination.route } == true
+                        NavigationBarItem(
+                            selected = selected,
+                            onClick = {
+                                if (destination == AppDestination.Chat) {
+                                    openChat()
+                                } else {
+                                    navigateToShellDestination(destination)
+                                }
+                            },
+                            icon = {
+                                androidx.compose.material3.Icon(
+                                    imageVector = destination.icon,
+                                    contentDescription = destination.label
+                                )
+                            },
+                            label = { Text(destination.label) },
+                            alwaysShowLabel = false,
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = MaterialTheme.colorScheme.primary,
+                                selectedTextColor = MaterialTheme.colorScheme.primary,
+                                indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                            )
+                        )
+                    }
+                }
+            }
+        ) { innerPadding ->
+            NavHost(
+                navController = navController,
+                startDestination = AppDestination.Dashboard.route,
+                modifier = Modifier.padding(innerPadding)
+            ) {
+                composable(AppDestination.Dashboard.route) {
+                    DashboardScreen(
+                        uiState = uiState,
+                        onCreateRoom = { viewModel.toggleCreateRoom(true) },
+                        onDismissCreateRoom = { viewModel.toggleCreateRoom(false) },
+                        onManageAgents = { viewModel.toggleManageAgents(true) },
+                        onDismissManageAgents = { viewModel.toggleManageAgents(false) },
+                        onUpdateRoomTitle = viewModel::updateNewRoomTitle,
+                        onUpdateRoomPurpose = viewModel::updateNewRoomPurpose,
+                        onToggleAgent = viewModel::toggleAgentSelection,
+                        onSetAgentHidden = viewModel::setAgentHidden,
+                        onConfirmCreateRoom = {
+                            viewModel.createRoom { roomId -> openChat(roomId) }
+                        },
+                        onDeleteRoom = viewModel::deleteRoom,
+                        onOpenAgent = { agentId ->
+                            val roomId = viewModel.openAgentRoom(agentId)
+                            openChat(roomId)
+                        },
+                        onOpenRoom = { roomId -> openChat(roomId) },
+                        onOpenSettings = { navigateToShellDestination(AppDestination.Settings) }
+                    )
+                }
+                composable(AppDestination.Agents.route) {
+                    AgentsScreen(
+                        uiState = uiState,
+                        onOpenAgent = { agentId ->
+                            val roomId = viewModel.openAgentRoom(agentId)
+                            openChat(roomId)
+                        },
+                        onOpenDashboard = { navigateToShellDestination(AppDestination.Dashboard) },
+                        onManageAgents = { viewModel.toggleManageAgents(true) },
+                        onDismissManageAgents = { viewModel.toggleManageAgents(false) },
+                        onSetAgentHidden = viewModel::setAgentHidden,
+                        onMoveAgent = viewModel::moveAgent,
+                        onSetAgentVoiceProvider = viewModel::setAgentVoiceProvider,
+                        onSelectAgentVoice = viewModel::selectAgentVoice,
+                        onLoadVoiceOptionsForProvider = viewModel::refreshVoiceOptionsForProvider
+                    )
+                }
+                // Chat behavior is intentionally preserved here; only the surrounding shell changes.
+                composable(AppDestination.Chat.route) {
+                    RoomScreen(
+                        uiState = uiState,
+                        onBack = {
+                            if (!navController.popBackStack()) {
+                                navigateToShellDestination(AppDestination.Dashboard)
+                            }
+                        },
+                        onDraftChange = viewModel::updateDraft,
+                        onSend = viewModel::sendCurrentMessage,
+                        onSelectSession = viewModel::selectRoom,
+                        onDeleteSession = viewModel::deleteRoom,
+                        onToggleVoiceSettings = viewModel::toggleVoiceSettings,
+                        onSetVoiceProvider = viewModel::setVoiceProvider,
+                        onUpdateCartesiaApiKey = viewModel::updateCartesiaApiKey,
+                        onUpdateCartesiaModelId = viewModel::updateCartesiaModelId,
+                        onRefreshVoiceOptions = viewModel::refreshVoiceOptions,
+                        onSelectCartesiaVoice = viewModel::selectCartesiaVoice,
+                        onUpdateKokoroEndpoint = viewModel::updateKokoroEndpoint,
+                        onUpdateKokoroApiKey = viewModel::updateKokoroApiKey,
+                        onUpdateKokoroModel = viewModel::updateKokoroModel,
+                        onUpdateKokoroVoice = viewModel::updateKokoroVoice,
+                        onUpdateLemonfoxApiKey = viewModel::updateLemonfoxApiKey,
+                        onUpdateLemonfoxLanguage = viewModel::updateLemonfoxLanguage,
+                        onUpdateLemonfoxSpeed = viewModel::updateLemonfoxSpeed,
+                        onSelectLemonfoxVoice = viewModel::selectLemonfoxVoice,
+                        onSaveVoiceProfile = viewModel::saveCurrentVoiceProfile,
+                        onApplyVoiceProfile = viewModel::applyVoiceProfile,
+                        onDeleteVoiceProfile = viewModel::deleteVoiceProfile,
+                        onTestVoice = viewModel::testVoiceSample,
+                        onPlayLatestMessage = viewModel::playLatestMessage,
+                        onPlayMessage = viewModel::playMessage,
+                        onStopPlayback = viewModel::stopPlayback,
+                        onToggleInternalMessages = viewModel::setShowInternalMessages,
+                        onStartPolling = viewModel::startSelectedRoomPolling,
+                        onStopPolling = viewModel::stopSelectedRoomPolling
+                    )
+                }
+                composable(AppDestination.Cron.route) {
+                    CronScreen(
+                        uiState = uiState,
+                        onRefresh = {
+                            viewModel.refreshMissionControlCapabilities()
+                            viewModel.refreshCronJobs()
+                        },
+                        onSelectJob = viewModel::selectCronJob,
+                        onRefreshRuns = viewModel::refreshCronRuns,
+                        onToggleEnabled = viewModel::setCronEnabled,
+                        onRunJob = viewModel::runCronJob,
+                        onDeleteJob = viewModel::deleteCronJob,
+                        onCreateJob = viewModel::createCronJob,
+                        onUpdateJob = viewModel::updateCronJob,
+                        onClearActionMessage = viewModel::clearCronActionMessage
+                    )
+                }
+                composable(AppDestination.Skills.route) {
+                    SkillsScreen(
+                        uiState = uiState,
+                        onRefresh = {
+                            viewModel.refreshMissionControlCapabilities()
+                            viewModel.refreshSkills()
+                        },
+                        onSelectSkill = viewModel::selectSkill,
+                        onToggleHidden = viewModel::toggleSkillHidden,
+                        onLoadSkillFiles = viewModel::loadSkillFiles,
+                        onOpenSkillFile = viewModel::openSkillFile,
+                        onUpdateSkillFileContent = viewModel::updateSkillFileContent,
+                        onSaveSelectedSkillFile = viewModel::saveSelectedSkillFile,
+                        onInstallSkill = viewModel::installSkill,
+                        onSetSkillEnabled = viewModel::setSkillEnabled,
+                        onUninstallSkill = viewModel::uninstallSkill,
+                        onCheckSkill = viewModel::checkSkill,
+                        onUpdateSkillFromSource = viewModel::updateSkillFromSource,
+                        onBrowseSkillsHub = viewModel::browseSkillsHub,
+                        onSearchSkillsHub = viewModel::searchSkillsHub,
+                        onInspectHubSkill = viewModel::inspectHubSkill,
+                        onInstallHubSkill = viewModel::installHubSkill
+                    )
+                }
+                composable(AppDestination.Settings.route) {
+                    SettingsScreen(
+                        uiState = uiState,
+                        onBack = {
+                            if (!navController.popBackStack()) {
+                                navigateToShellDestination(AppDestination.Dashboard)
+                            }
+                        },
+                        onRequestNotificationPermission = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                viewModel.refreshNotificationPermission()
+                            }
+                        },
+                        onSetNotificationsEnabled = viewModel::setNotificationsEnabled,
+                        onSetMessageNotificationsEnabled = viewModel::setMessageNotificationsEnabled,
+                        onSetCronNotificationsEnabled = viewModel::setCronNotificationsEnabled,
+                        onSetBackgroundSyncEnabled = viewModel::setBackgroundSyncEnabled,
+                        onSetRoomNotificationsEnabled = viewModel::setRoomNotificationsEnabled,
+                        onSetCronJobNotificationsEnabled = viewModel::setCronJobNotificationsEnabled,
+                        onSetThemeMode = viewModel::setThemeMode,
+                        onUpdateCartesiaApiKey = viewModel::updateCartesiaApiKey,
+                        onUpdateCartesiaModelId = viewModel::updateCartesiaModelId,
+                        onUpdateKokoroEndpoint = viewModel::updateKokoroEndpoint,
+                        onUpdateKokoroApiKey = viewModel::updateKokoroApiKey,
+                        onUpdateKokoroModel = viewModel::updateKokoroModel,
+                        onUpdateLemonfoxApiKey = viewModel::updateLemonfoxApiKey,
+                        onUpdateLemonfoxLanguage = viewModel::updateLemonfoxLanguage,
+                        onUpdateLemonfoxSpeed = viewModel::updateLemonfoxSpeed
+                    )
+                }
+            }
         }
     }
 }

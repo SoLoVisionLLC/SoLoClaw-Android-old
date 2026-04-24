@@ -93,8 +93,7 @@ class FakeOpenClawRepository : OpenClawRepository {
             body = text,
             timestampLabel = "Now",
             internal = false,
-            messageKey = buildMessageKey("user", "solo", text, timestampMs),
-            timestampMs = timestampMs
+            messageKey = buildMessageKey("user", "solo", text)
         )
     }
 
@@ -120,8 +119,7 @@ class FakeOpenClawRepository : OpenClawRepository {
                 body = "Room created with ${agentIds.size} agents.",
                 timestampLabel = "Now",
                 internal = true,
-                messageKey = buildMessageKey("system", "system", "Room created with ${agentIds.size} agents.", timestampMs),
-                timestampMs = timestampMs
+                messageKey = buildMessageKey("system", "system", "Room created with ${agentIds.size} agents.")
             )
         )
         return room
@@ -151,6 +149,10 @@ class GatewayRpcOpenClawTransport(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     okHttpClient: OkHttpClient? = null
 ) : OpenClawTransport {
+
+    private companion object {
+        const val PRIMARY_SESSION_LABEL = "Halo"
+    }
 
     private val deviceAuthStore = OpenClawDeviceAuthStore(context)
     private val deviceIdentity = OpenClawDeviceIdentity(deviceAuthStore)
@@ -248,7 +250,7 @@ class GatewayRpcOpenClawTransport(
                         unreadCount = 0,
                         active = mainSessionKey == config.sessionKey,
                         lastActivity = if (agentSessions.isEmpty()) "Live" else "Available",
-                        sessionLabel = "Main"
+                        sessionLabel = PRIMARY_SESSION_LABEL
                     )
                     if (agentSessions.isEmpty()) {
                         listOf(mainRoom)
@@ -316,8 +318,7 @@ class GatewayRpcOpenClawTransport(
                     body = request.text,
                     timestampLabel = "Now",
                     internal = false,
-                    messageKey = buildMessageKey("user", "solo", request.text, userTimestampMs),
-                    timestampMs = userTimestampMs
+                    messageKey = buildMessageKey("user", "solo", request.text)
                 )
 
                 val targetAgentIds = resolveLocalRoomTargets(localRoom, roomMessages, request.text)
@@ -335,10 +336,8 @@ class GatewayRpcOpenClawTransport(
                         messageKey = buildMessageKey(
                             "system",
                             "system",
-                            "No agent was targeted. In group rooms, use @agent-name for one agent or @all for the full room.",
-                            systemTimestampMs
-                        ),
-                        timestampMs = systemTimestampMs
+                            "No agent was targeted. In group rooms, use @agent-name for one agent or @all for the full room."
+                        )
                     )
                     persistLocalRooms()
                     return@withContext
@@ -384,10 +383,8 @@ class GatewayRpcOpenClawTransport(
                         messageKey = buildMessageKey(
                             "system",
                             "system",
-                            "Could not reach: ${failedAgents.joinToString(", ")}",
-                            systemTimestampMs
-                        ),
-                        timestampMs = systemTimestampMs
+                            "Could not reach: ${failedAgents.joinToString(", ")}"
+                        )
                     )
                 }
 
@@ -442,10 +439,8 @@ class GatewayRpcOpenClawTransport(
                 messageKey = buildMessageKey(
                     "system",
                     "system",
-                    "Room created for ${room.members.joinToString(", ")}. Use @agent-name to target one agent, or @all to broadcast to the full room. Messages will be relayed into room-specific agent sessions for ${room.title}.",
-                    timestampMs
-                ),
-                timestampMs = timestampMs
+                    "Room created for ${room.members.joinToString(", ")}. Use @agent-name to target one agent, or @all to broadcast to the full room. Messages will be relayed into room-specific agent sessions for ${room.title}."
+                )
             )
         )
         localRoomReplyCursor[room.id] = memberSessionKeys.mapValues { (_, sessionKey) ->
@@ -498,6 +493,51 @@ class GatewayRpcOpenClawTransport(
         Log.d("OpenClawGateway", "Deleted remote session key=$roomId")
     }
 
+    suspend fun requestGatewayMethod(
+        method: String,
+        params: Map<String, Any?> = emptyMap()
+    ): Map<String, Any?> = request(method, params)
+
+    suspend fun requestHttpJson(
+        path: String,
+        method: String = "GET",
+        body: String? = null
+    ): String = withContext(dispatcher) {
+        val requestBuilder = Request.Builder()
+            .url("${apiBaseUrl()}${path.ensureLeadingSlash()}")
+            .header("Content-Type", "application/json")
+
+        config.apiKey?.trim()?.takeIf { it.isNotEmpty() }?.let { apiKey ->
+            requestBuilder.header("Authorization", "Bearer $apiKey")
+            requestBuilder.header("X-API-Key", apiKey)
+        }
+
+        val jsonType = "application/json; charset=utf-8".toMediaType()
+        val request = when (method.uppercase()) {
+            "POST" -> requestBuilder.post((body ?: "").toRequestBody(jsonType)).build()
+            "PUT" -> requestBuilder.put((body ?: "").toRequestBody(jsonType)).build()
+            "PATCH" -> requestBuilder.patch((body ?: "").toRequestBody(jsonType)).build()
+            "DELETE" -> if (body == null) requestBuilder.delete().build()
+                else requestBuilder.delete(body.toRequestBody(jsonType)).build()
+            else -> requestBuilder.get().build()
+        }
+
+        client.newCall(request).execute().use { response ->
+            val payload = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                error("HTTP ${response.code}: ${payload.ifBlank { response.message }}")
+            }
+            payload
+        }
+    }
+
+    fun apiBaseUrl(): String {
+        return config.gatewayUrl
+            .replaceFirst("wss://", "https://")
+            .replaceFirst("ws://", "http://")
+            .trimEnd('/')
+    }
+
     private suspend fun fetchRemoteRoomMessages(roomId: String): List<RoomMessage> {
         val response = request(
             method = "chat.history",
@@ -520,7 +560,7 @@ class GatewayRpcOpenClawTransport(
                 "assistant" -> agentIdFromSessionKey(roomId)
                 else -> "system"
             }
-            val messageKey = buildMessageKey(role, senderId, content, timestampMs ?: index.toLong())
+            val messageKey = buildMessageKey(role, senderId, content)
             val internal = isInternalHistoryMessage(role, content, message)
 
             when (role) {
@@ -533,8 +573,7 @@ class GatewayRpcOpenClawTransport(
                     body = content,
                     timestampLabel = formatTimestampLabel(timestampMs),
                     internal = internal,
-                    messageKey = messageKey,
-                    timestampMs = timestampMs
+                    messageKey = messageKey
                 )
 
                 "assistant" -> RoomMessage(
@@ -546,8 +585,7 @@ class GatewayRpcOpenClawTransport(
                     body = content,
                     timestampLabel = formatTimestampLabel(timestampMs),
                     internal = internal,
-                    messageKey = messageKey,
-                    timestampMs = timestampMs
+                    messageKey = messageKey
                 )
 
                 else -> RoomMessage(
@@ -559,8 +597,7 @@ class GatewayRpcOpenClawTransport(
                     body = content,
                     timestampLabel = formatTimestampLabel(timestampMs),
                     internal = internal,
-                    messageKey = messageKey,
-                    timestampMs = timestampMs
+                    messageKey = messageKey
                 )
             }
         }
@@ -1191,7 +1228,7 @@ class GatewayRpcOpenClawTransport(
 
     private fun friendlySessionTitle(sessionKey: String): String {
         val agent = agentIdFromSessionKey(sessionKey)
-        return agent.replaceFirstChar { it.uppercase() }
+        return displayAgentName(agent)
     }
 
     private suspend fun resolveLocalRoomTargets(
@@ -1291,8 +1328,7 @@ class GatewayRpcOpenClawTransport(
 
     private fun resolveRoomAgentDisplayName(roomId: String, agentId: String): String {
         return localRoomMemberNames[roomId]?.get(agentId)
-            ?: cachedAgents.firstOrNull { it.id.equals(agentId, ignoreCase = true) }?.name
-            ?: prettifyId(agentId)
+            ?: displayAgentName(agentId)
     }
 
     private fun agentMainSessionKey(agentId: String): String = "agent:$agentId:main"
@@ -1355,13 +1391,18 @@ class GatewayRpcOpenClawTransport(
 
     private fun sessionLabelForKey(key: String): String {
         val parts = key.split(':')
-        if (parts.size < 3) return "Main"
+        if (parts.size < 3) return PRIMARY_SESSION_LABEL
         val tail = parts.drop(2)
         return when {
-            tail.firstOrNull().equals("main", ignoreCase = true) -> "Main"
+            tail.firstOrNull().equals("main", ignoreCase = true) -> PRIMARY_SESSION_LABEL
             tail.firstOrNull().equals("room", ignoreCase = true) -> tail.drop(1).joinToString(":").ifBlank { "Room Session" }
             else -> tail.joinToString(":").ifBlank { "Session" }
         }.replace('-', ' ').replaceFirstChar { it.uppercase() }
+    }
+
+    private fun displayAgentName(agentId: String): String {
+        return cachedAgents.firstOrNull { it.id.equals(agentId, ignoreCase = true) }?.name
+            ?: if (agentId.equals("main", ignoreCase = true)) PRIMARY_SESSION_LABEL else prettifyId(agentId)
     }
 
     private fun agentIdFromSessionKey(sessionKey: String): String {
@@ -1562,8 +1603,10 @@ private fun escapeJson(value: String): String {
         .replace("\t", "\\t")
 }
 
-private fun buildMessageKey(role: String, senderId: String, body: String, timestampMs: Long): String {
-    val normalized = listOf(role.trim().lowercase(), senderId.trim().lowercase(), timestampMs.toString(), body.trim())
+private fun String.ensureLeadingSlash(): String = if (startsWith('/')) this else "/$this"
+
+private fun buildMessageKey(role: String, senderId: String, body: String): String {
+    val normalized = listOf(role.trim().lowercase(), senderId.trim().lowercase(), body.trim())
         .joinToString("|")
     val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
     val fingerprint = digest.joinToString("") { "%02x".format(it) }.take(16)
