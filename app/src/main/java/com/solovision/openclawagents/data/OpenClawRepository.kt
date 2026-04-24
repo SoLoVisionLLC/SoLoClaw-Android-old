@@ -10,12 +10,15 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import java.net.URI
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -29,6 +32,7 @@ private val REQUESTED_OPERATOR_SCOPES = listOf(
     "operator.talk.secrets",
     "operator.admin"
 )
+private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
 interface OpenClawRepository {
     suspend fun getAgents(): List<Agent>
@@ -181,6 +185,7 @@ class GatewayRpcOpenClawTransport(
     }
 
     override suspend fun fetchRooms(): List<CollaborationRoom> = withContext(dispatcher) {
+        syncSharedRoomStateFromServer()
         val agents = cachedAgents.ifEmpty { fetchAgents() }
         val response = request(
             method = "sessions.list",
@@ -388,6 +393,7 @@ class GatewayRpcOpenClawTransport(
 
                 syncLocalRoomReplies(request.roomId, awaitReplies = true)
                 persistLocalRooms()
+                pushSharedRoomStateToServer()
                 return@withContext
             }
 
@@ -401,6 +407,7 @@ class GatewayRpcOpenClawTransport(
     }
 
     override suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom = withContext(dispatcher) {
+        syncSharedRoomStateFromServer()
         val timestampMs = System.currentTimeMillis()
         val room = CollaborationRoom(
             id = "local-room-$timestampMs",
@@ -445,6 +452,7 @@ class GatewayRpcOpenClawTransport(
             latestAssistantMessageKey(sessionKey)
         }.toMutableMap()
         persistLocalRooms()
+        pushSharedRoomStateToServer()
         return@withContext room
     }
 
@@ -473,6 +481,7 @@ class GatewayRpcOpenClawTransport(
             localRoomSessionKeys.remove(roomId)
             localRoomMemberNames.remove(roomId)
             persistLocalRooms()
+            pushSharedRoomStateToServer()
             return@withContext
         }
 
@@ -938,12 +947,27 @@ class GatewayRpcOpenClawTransport(
         if (addedAny && roomMessages.isNotEmpty()) {
             localRooms[roomId] = room.copy(lastActivity = roomMessages.last().timestampLabel)
             persistLocalRooms()
+            runCatching { pushSharedRoomStateToServer() }
+                .onFailure { Log.w("OpenClawGateway", "Shared room save after reply sync failed", it) }
         }
         return addedAny
     }
 
     private fun restoreLocalRooms() {
-        val snapshot = localRoomStore.read()
+        applyLocalRoomSnapshot(localRoomStore.read())
+    }
+
+    private fun persistLocalRooms() {
+        localRoomStore.write(currentLocalRoomSnapshot())
+    }
+
+    private fun applyLocalRoomSnapshot(snapshot: LocalRoomSnapshot) {
+        localRooms.clear()
+        localMessages.clear()
+        localRoomReplyCursor.clear()
+        localRoomSessionKeys.clear()
+        localRoomMemberNames.clear()
+
         snapshot.rooms.forEach { room ->
             localRooms[room.id] = room
         }
@@ -957,16 +981,93 @@ class GatewayRpcOpenClawTransport(
         localRoomMemberNames.putAll(snapshot.memberNames)
     }
 
-    private fun persistLocalRooms() {
-        localRoomStore.write(
-            LocalRoomSnapshot(
-                rooms = localRooms.values.toList(),
-                messages = localMessages.mapValues { it.value.toList() },
-                replyCursors = localRoomReplyCursor.mapValues { it.value.toMap() },
-                sessionKeys = localRoomSessionKeys.toMap(),
-                memberNames = localRoomMemberNames.toMap()
-            )
+    private fun currentLocalRoomSnapshot(): LocalRoomSnapshot {
+        return LocalRoomSnapshot(
+            rooms = localRooms.values.toList(),
+            messages = localMessages.mapValues { it.value.toList() },
+            replyCursors = localRoomReplyCursor.mapValues { it.value.toMap() },
+            sessionKeys = localRoomSessionKeys.toMap(),
+            memberNames = localRoomMemberNames.toMap()
         )
+    }
+
+    private suspend fun syncSharedRoomStateFromServer() {
+        val errors = mutableListOf<String>()
+        for (url in sharedRoomStateUrls()) {
+            val result = runCatching {
+                val request = Request.Builder()
+                    .url(url)
+                    .get()
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        throw IllegalStateException("Shared room fetch failed (${response.code})")
+                    }
+                    applyLocalRoomSnapshot(LocalRoomStore.decodeSnapshot(response.body?.string()))
+                    persistLocalRooms()
+                }
+            }
+            if (result.isSuccess) return
+            val message = result.exceptionOrNull()?.message ?: "unknown"
+            errors += "$url -> $message"
+        }
+        Log.w("OpenClawGateway", "Shared room fetch failed; using local cache. Tried: ${errors.joinToString(" | ")}")
+    }
+
+    private suspend fun pushSharedRoomStateToServer() {
+        val payload = LocalRoomStore.encodeSnapshot(currentLocalRoomSnapshot()).apply {
+            put("version", 1)
+            put("updatedAt", System.currentTimeMillis())
+        }.toString()
+        val errors = mutableListOf<String>()
+        for (url in sharedRoomStateUrls()) {
+            val result = runCatching {
+                val request = Request.Builder()
+                    .url(url)
+                    .put(payload.toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        throw IllegalStateException("Shared room save failed (${response.code})")
+                    }
+                }
+            }
+            if (result.isSuccess) return
+            val message = result.exceptionOrNull()?.message ?: "unknown"
+            errors += "$url -> $message"
+        }
+        Log.w("OpenClawGateway", "Shared room save failed; kept local cache. Tried: ${errors.joinToString(" | ")}")
+    }
+
+    private fun sharedRoomStateUrls(): List<String> {
+        val gatewayHttpBase = config.gatewayUrl
+            .replaceFirst("wss://", "https://")
+            .replaceFirst("ws://", "http://")
+            .trimEnd('/')
+        val gatewayHttpUri = runCatching { URI(gatewayHttpBase) }.getOrNull()
+        val gatewayHost = gatewayHttpUri?.host
+        val gatewayScheme = gatewayHttpUri?.scheme ?: "https"
+
+        return buildList {
+            fun addCandidate(url: String?) {
+                val normalized = url?.trim()?.takeIf { it.isNotBlank() } ?: return
+                if (!contains(normalized)) add(normalized)
+            }
+
+            addCandidate("http://10.0.2.2:3124/api/group-rooms-state")
+            addCandidate("http://127.0.0.1:3124/api/group-rooms-state")
+            addCandidate("http://localhost:3124/api/group-rooms-state")
+            addCandidate("http://10.0.2.2:3000/api/group-rooms-state")
+            addCandidate("http://127.0.0.1:3000/api/group-rooms-state")
+            addCandidate("http://localhost:3000/api/group-rooms-state")
+            gatewayHost?.let { host ->
+                addCandidate("$gatewayScheme://$host/api/group-rooms-state")
+                addCandidate("$gatewayScheme://$host:3124/api/group-rooms-state")
+                addCandidate("$gatewayScheme://$host:3000/api/group-rooms-state")
+            }
+            addCandidate("https://dashboard.solobot.cloud/api/group-rooms-state")
+            addCandidate("https://solobot.cloud/api/group-rooms-state")
+        }
     }
 
     private fun groupRelaySessionKey(agentId: String, roomId: String, roomTitle: String): String {

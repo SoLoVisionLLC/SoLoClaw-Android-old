@@ -30,65 +30,81 @@ class LocalRoomStore private constructor(
 
     fun read(): LocalRoomSnapshot {
         val raw = prefs?.getString(PREF_LOCAL_ROOM_STATE, null)?.trim().orEmpty()
-        if (raw.isBlank()) return LocalRoomSnapshot()
-        return runCatching {
-            val root = JSONObject(raw)
-            val rooms = root.optJSONArray("rooms").toCollaborationRooms()
-            val messages = root.optJSONObject("messages").toMessagesByRoom()
-            val replyCursors = root.optJSONObject("replyCursors").toNullableStringMapByRoom()
-            val sessionKeys = root.optJSONObject("sessionKeys").toStringMapByRoom()
-            val memberNames = root.optJSONObject("memberNames").toStringMapByRoom()
-            LocalRoomSnapshot(
-                rooms = rooms,
-                messages = messages,
-                replyCursors = replyCursors,
-                sessionKeys = sessionKeys,
-                memberNames = memberNames
-            )
-        }.getOrElse { LocalRoomSnapshot() }
+        return decodeSnapshot(raw)
     }
 
     fun write(snapshot: LocalRoomSnapshot) {
-        val root = JSONObject().apply {
-            put("rooms", JSONArray().apply {
-                snapshot.rooms.forEach { room -> put(room.toJson()) }
-            })
-            put("messages", JSONObject().apply {
-                snapshot.messages.forEach { (roomId, roomMessages) ->
-                    put(roomId, JSONArray().apply {
-                        roomMessages.forEach { message -> put(message.toJson()) }
-                    })
+        prefs?.edit()?.putString(PREF_LOCAL_ROOM_STATE, encodeSnapshot(snapshot).toString())?.apply()
+    }
+
+    companion object {
+        fun decodeSnapshot(raw: String?): LocalRoomSnapshot {
+            val trimmed = raw?.trim().orEmpty()
+            if (trimmed.isBlank()) return LocalRoomSnapshot()
+            val codec = LocalRoomStore(null)
+            return runCatching {
+                with(codec) {
+                    val root = JSONObject(trimmed)
+                    val rooms = root.optJSONArray("rooms").toCollaborationRooms()
+                    val messages = root.optJSONObject("messages").toMessagesByRoom()
+                    val replyCursors = root.optJSONObject("replyCursors").toNullableStringMapByRoom()
+                    val sessionKeys = root.optJSONObject("sessionKeys").toStringMapByRoom()
+                    val memberNames = root.optJSONObject("memberNames").toStringMapByRoom()
+                    LocalRoomSnapshot(
+                        rooms = rooms,
+                        messages = messages,
+                        replyCursors = replyCursors,
+                        sessionKeys = sessionKeys,
+                        memberNames = memberNames
+                    )
                 }
-            })
-            put("replyCursors", JSONObject().apply {
-                snapshot.replyCursors.forEach { (roomId, cursors) ->
-                    put(roomId, JSONObject().apply {
-                        cursors.forEach { (agentId, cursor) ->
-                            put(agentId, cursor)
-                        }
-                    })
-                }
-            })
-            put("sessionKeys", JSONObject().apply {
-                snapshot.sessionKeys.forEach { (roomId, sessionMap) ->
-                    put(roomId, JSONObject().apply {
-                        sessionMap.forEach { (agentId, sessionKey) ->
-                            put(agentId, sessionKey)
-                        }
-                    })
-                }
-            })
-            put("memberNames", JSONObject().apply {
-                snapshot.memberNames.forEach { (roomId, memberMap) ->
-                    put(roomId, JSONObject().apply {
-                        memberMap.forEach { (agentId, memberName) ->
-                            put(agentId, memberName)
-                        }
-                    })
-                }
-            })
+            }.getOrElse { LocalRoomSnapshot() }
         }
-        prefs?.edit()?.putString(PREF_LOCAL_ROOM_STATE, root.toString())?.apply()
+
+        fun encodeSnapshot(snapshot: LocalRoomSnapshot): JSONObject {
+            val codec = LocalRoomStore(null)
+            return with(codec) {
+                JSONObject().apply {
+                    put("rooms", JSONArray().apply {
+                        snapshot.rooms.forEach { room -> put(room.toJson()) }
+                    })
+                    put("messages", JSONObject().apply {
+                        snapshot.messages.forEach { (roomId, roomMessages) ->
+                            put(roomId, JSONArray().apply {
+                                roomMessages.forEach { message -> put(message.toJson()) }
+                            })
+                        }
+                    })
+                    put("replyCursors", JSONObject().apply {
+                        snapshot.replyCursors.forEach { (roomId, cursors) ->
+                            put(roomId, JSONObject().apply {
+                                cursors.forEach { (agentId, cursor) ->
+                                    put(agentId, cursor)
+                                }
+                            })
+                        }
+                    })
+                    put("sessionKeys", JSONObject().apply {
+                        snapshot.sessionKeys.forEach { (roomId, sessionMap) ->
+                            put(roomId, JSONObject().apply {
+                                sessionMap.forEach { (agentId, sessionKey) ->
+                                    put(agentId, sessionKey)
+                                }
+                            })
+                        }
+                    })
+                    put("memberNames", JSONObject().apply {
+                        snapshot.memberNames.forEach { (roomId, memberMap) ->
+                            put(roomId, JSONObject().apply {
+                                memberMap.forEach { (agentId, memberName) ->
+                                    put(agentId, memberName)
+                                }
+                            })
+                        }
+                    })
+                }
+            }
+        }
     }
 
     private fun JSONArray?.toCollaborationRooms(): List<CollaborationRoom> {
