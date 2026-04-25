@@ -120,7 +120,7 @@ fun RoomScreen(
         allMessages
     } else {
         allMessages.filterNot { it.internal || it.senderType == MessageSenderType.SYSTEM }
-    }
+    }.distinctBy { it.id.ifBlank { it.messageKey } }
     val listState = rememberLazyListState()
     var initialScrollPending by rememberSaveable(roomId, uiState.showInternalMessages) { mutableStateOf(true) }
     var sessionsExpanded by remember { mutableStateOf(false) }

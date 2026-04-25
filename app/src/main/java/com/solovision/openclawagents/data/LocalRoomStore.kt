@@ -71,7 +71,9 @@ class LocalRoomStore private constructor(
                     put("messages", JSONObject().apply {
                         snapshot.messages.forEach { (roomId, roomMessages) ->
                             put(roomId, JSONArray().apply {
-                                roomMessages.forEach { message -> put(message.toJson()) }
+                                roomMessages
+                                    .distinctBy { message -> message.id.ifBlank { message.messageKey } }
+                                    .forEach { message -> put(message.toJson()) }
                             })
                         }
                     })
@@ -164,7 +166,7 @@ class LocalRoomStore private constructor(
                     }
                 }
             }
-            out[roomId] = messages
+            out[roomId] = messages.distinctBy { message -> message.id.ifBlank { message.messageKey } }
         }
         return out
     }
