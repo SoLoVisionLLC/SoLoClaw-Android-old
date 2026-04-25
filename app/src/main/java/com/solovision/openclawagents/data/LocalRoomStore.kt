@@ -149,18 +149,32 @@ class LocalRoomStore private constructor(
                         val message = entries.optJSONObject(index) ?: continue
                         add(
                             RoomMessage(
-                                id = message.optString("id"),
-                                senderId = message.optString("senderId"),
-                                senderName = message.optString("senderName"),
+                                id = message.optString("id").ifBlank {
+                                    message.optString("key").ifBlank { message.optString("messageKey") }
+                                },
+                                senderId = message.optString("senderId").ifBlank {
+                                    message.optString("fromAgentId").ifBlank { message.optString("from") }
+                                },
+                                senderName = message.optString("senderName").ifBlank {
+                                    message.optString("from").ifBlank { message.optString("senderId") }
+                                },
                                 senderRole = message.optString("senderRole"),
                                 senderType = runCatching {
                                     MessageSenderType.valueOf(message.optString("senderType"))
-                                }.getOrDefault(MessageSenderType.SYSTEM),
-                                body = message.optString("body"),
-                                timestampLabel = message.optString("timestampLabel", "Now"),
+                                }.getOrDefault(
+                                    when (message.optString("from").lowercase()) {
+                                        "solo", "user" -> MessageSenderType.USER
+                                        "system" -> MessageSenderType.SYSTEM
+                                        else -> MessageSenderType.AGENT
+                                    }
+                                ),
+                                body = message.optString("body").ifBlank { message.optString("text") },
+                                timestampLabel = message.optString("timestampLabel").ifBlank { "Now" },
                                 spoken = message.optBoolean("spoken", false),
                                 internal = message.optBoolean("internal", false),
-                                messageKey = message.optString("messageKey").ifBlank { message.optString("id") }
+                                messageKey = message.optString("messageKey").ifBlank {
+                                    message.optString("key").ifBlank { message.optString("id") }
+                                }
                             )
                         )
                     }
@@ -237,10 +251,15 @@ class LocalRoomStore private constructor(
             put("senderRole", senderRole)
             put("senderType", senderType.name)
             put("body", body)
+            put("text", body) // dashboard compatibility
+            put("from", senderName.ifBlank { senderId }) // dashboard compatibility
+            put("fromAgentId", senderId.takeIf { senderType == MessageSenderType.AGENT })
             put("timestampLabel", timestampLabel)
+            put("time", System.currentTimeMillis())
             put("spoken", spoken)
             put("internal", internal)
             put("messageKey", messageKey)
+            put("key", messageKey) // dashboard compatibility
         }
     }
 }
