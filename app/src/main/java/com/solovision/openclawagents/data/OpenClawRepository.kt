@@ -1091,19 +1091,23 @@ class GatewayRpcOpenClawTransport(
                 if (!contains(normalized)) add(normalized)
             }
 
+            // Production devices reach the shared room state through the Cloudflare tunnel.
+            // Do not prefer localhost here: on a physical Android device localhost is the phone,
+            // not the SoLoBot host running the dashboard/gateway services.
+            addCandidate("https://dash.solobot.cloud/api/group-rooms-state")
+            gatewayHost?.let { host ->
+                addCandidate("$gatewayScheme://$host/api/group-rooms-state")
+            }
+            addCandidate("https://dashboard.solobot.cloud/api/group-rooms-state")
+            addCandidate("https://solobot.cloud/api/group-rooms-state")
+
+            // Local/emulator fallbacks are kept last for development only.
             addCandidate("http://10.0.2.2:3124/api/group-rooms-state")
             addCandidate("http://127.0.0.1:3124/api/group-rooms-state")
             addCandidate("http://localhost:3124/api/group-rooms-state")
             addCandidate("http://10.0.2.2:3000/api/group-rooms-state")
             addCandidate("http://127.0.0.1:3000/api/group-rooms-state")
             addCandidate("http://localhost:3000/api/group-rooms-state")
-            gatewayHost?.let { host ->
-                addCandidate("$gatewayScheme://$host/api/group-rooms-state")
-                addCandidate("$gatewayScheme://$host:3124/api/group-rooms-state")
-                addCandidate("$gatewayScheme://$host:3000/api/group-rooms-state")
-            }
-            addCandidate("https://dashboard.solobot.cloud/api/group-rooms-state")
-            addCandidate("https://solobot.cloud/api/group-rooms-state")
         }
     }
 

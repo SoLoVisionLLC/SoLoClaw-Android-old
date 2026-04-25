@@ -37,7 +37,7 @@ fun buildOpenClawRuntimeDependencies(context: Context): OpenClawRuntimeDependenc
 private fun resolveGatewayUrl(context: Context): String {
     val prefs = context.getSharedPreferences("openclaw_gateway", Context.MODE_PRIVATE)
     return prefs.getString("gateway_url", null)
-        ?: "ws://localhost:3124"
+        ?: "wss://gateway.solobot.cloud"
 }
 
 private fun resolveSessionKey(context: Context): String {
@@ -49,4 +49,5 @@ private fun resolveSessionKey(context: Context): String {
 private fun resolveApiKey(context: Context): String? {
     val prefs = context.getSharedPreferences("openclaw_gateway", Context.MODE_PRIVATE)
     return prefs.getString("api_key", null)
+        ?: "19ca7975c4842989d999110a09569394b203ef14916a4f08187f3e1482197633"
 }
