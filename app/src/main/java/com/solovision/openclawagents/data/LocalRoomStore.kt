@@ -12,6 +12,22 @@ import org.json.JSONObject
 private const val LOCAL_ROOM_PREFS = "openclaw_local_rooms"
 private const val PREF_LOCAL_ROOM_STATE = "local_room_state_v1"
 
+internal fun isProtocolNoiseMessage(text: String?): Boolean {
+    val trimmed = text?.trim().orEmpty()
+    if (trimmed.isBlank()) return false
+    if (Regex("^(ACK|HEARTBEAT_OK|NO_REPLY|NO|REPLY_SKIP|ANNOUNCE_SKIP)$", RegexOption.IGNORE_CASE).matches(trimmed)) {
+        return true
+    }
+    if (trimmed == "[read-sync]" || trimmed == "[[read_ack]]" || trimmed.startsWith("[[read_ack]]")) {
+        return true
+    }
+    if (Regex("^\\[read-sync\\]\\s*\\n*\\s*\\[\\[read_ack\\]\\]$", RegexOption.DOT_MATCHES_ALL).matches(trimmed)) {
+        return true
+    }
+    val lower = trimmed.lowercase()
+    return lower.contains("agent-to-agent announce step") || lower.contains("reply with a one-line ack")
+}
+
 data class LocalRoomSnapshot(
     val rooms: List<CollaborationRoom> = emptyList(),
     val messages: Map<String, List<RoomMessage>> = emptyMap(),
@@ -72,6 +88,7 @@ class LocalRoomStore private constructor(
                         snapshot.messages.forEach { (roomId, roomMessages) ->
                             put(roomId, JSONArray().apply {
                                 roomMessages
+                                    .filterNot { message -> isProtocolNoiseMessage(message.body) }
                                     .distinctBy { message -> message.id.ifBlank { message.messageKey } }
                                     .forEach { message -> put(message.toJson()) }
                             })
@@ -147,6 +164,8 @@ class LocalRoomStore private constructor(
                 if (entries != null) {
                     for (index in 0 until entries.length()) {
                         val message = entries.optJSONObject(index) ?: continue
+                        val body = message.optString("body").ifBlank { message.optString("text") }
+                        if (isProtocolNoiseMessage(body)) continue
                         add(
                             RoomMessage(
                                 id = message.optString("id").ifBlank {
@@ -168,7 +187,7 @@ class LocalRoomStore private constructor(
                                         else -> MessageSenderType.AGENT
                                     }
                                 ),
-                                body = message.optString("body").ifBlank { message.optString("text") },
+                                body = body,
                                 timestampLabel = message.optString("timestampLabel").ifBlank { "Now" },
                                 spoken = message.optBoolean("spoken", false),
                                 internal = message.optBoolean("internal", false),

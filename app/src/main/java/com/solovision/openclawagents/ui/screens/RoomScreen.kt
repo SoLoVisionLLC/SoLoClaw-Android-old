@@ -69,6 +69,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.text.selection.SelectionContainer
+import com.solovision.openclawagents.data.isProtocolNoiseMessage
 import com.solovision.openclawagents.model.AppUiState
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
@@ -120,7 +121,9 @@ fun RoomScreen(
         allMessages
     } else {
         allMessages.filterNot { it.internal || it.senderType == MessageSenderType.SYSTEM }
-    }.distinctBy { it.id.ifBlank { it.messageKey } }
+    }
+        .filterNot { isProtocolNoiseMessage(it.body) }
+        .distinctBy { it.id.ifBlank { it.messageKey } }
     val listState = rememberLazyListState()
     var initialScrollPending by rememberSaveable(roomId, uiState.showInternalMessages) { mutableStateOf(true) }
     var sessionsExpanded by remember { mutableStateOf(false) }

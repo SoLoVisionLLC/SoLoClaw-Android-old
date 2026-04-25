@@ -296,7 +296,7 @@ class GatewayRpcOpenClawTransport(
     override suspend fun fetchRoomMessages(roomId: String): List<RoomMessage> = withContext(dispatcher) {
         if (localRooms.containsKey(roomId)) {
             syncLocalRoomReplies(roomId, awaitReplies = false)
-            return@withContext localMessages[roomId].orEmpty().toList()
+            return@withContext localMessages[roomId].orEmpty().filterNot { isProtocolNoiseMessage(it.body) }.toList()
         }
 
         fetchRemoteRoomMessages(roomId)
@@ -554,6 +554,7 @@ class GatewayRpcOpenClawTransport(
             val content = flattenContent(message["content"])
                 ?: (message["text"] as? String)
                 ?: return@mapIndexedNotNull null
+            if (isProtocolNoiseMessage(content)) return@mapIndexedNotNull null
             val timestampMs = parseTimestampMs(message["timestamp"] ?: message["timestampMs"] ?: message["ts"])
             val senderId = when (role) {
                 "user" -> "solo"
@@ -937,7 +938,7 @@ class GatewayRpcOpenClawTransport(
                     Log.w("OpenClawGateway", "Failed syncing replies for $agentId", error)
                     return@forEach
                 }
-            val assistantMessages = history.filter { it.senderType == MessageSenderType.AGENT }
+            val assistantMessages = history.filter { it.senderType == MessageSenderType.AGENT && !isProtocolNoiseMessage(it.body) }
             Log.d(
                 "OpenClawGateway",
                 "syncLocalRoomReplies roomId=$roomId agentId=$agentId sessionKey=$sessionKey historyCount=${history.size} assistantCount=${assistantMessages.size} previousKey=${cursors[agentId]}"
