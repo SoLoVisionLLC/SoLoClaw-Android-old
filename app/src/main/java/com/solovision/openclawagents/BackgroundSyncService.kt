@@ -3,6 +3,8 @@ package com.solovision.openclawagents
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import com.solovision.openclawagents.data.AppNotificationManager
@@ -49,11 +51,39 @@ class BackgroundSyncService : Service() {
                 return START_NOT_STICKY
             }
 
+            ACTION_START_TALK_MIC -> {
+                startForegroundWithType(appNotificationManager.buildTalkModeNotification(), microphone = true)
+                return START_STICKY
+            }
+
+            ACTION_STOP_TALK_MIC -> {
+                if (pollingJob?.isActive == true) {
+                    startForegroundWithType(appNotificationManager.buildBackgroundSyncNotification(), microphone = false)
+                } else {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+                return START_NOT_STICKY
+            }
+
             else -> {
-                startForeground(NOTIFICATION_ID, appNotificationManager.buildBackgroundSyncNotification())
+                startForegroundWithType(appNotificationManager.buildBackgroundSyncNotification(), microphone = false)
                 startPolling()
                 return START_STICKY
             }
+        }
+    }
+
+    private fun startForegroundWithType(notification: android.app.Notification, microphone: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val type = if (microphone) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            }
+            startForeground(NOTIFICATION_ID, notification, type)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
@@ -170,6 +200,8 @@ class BackgroundSyncService : Service() {
         private const val POLL_INTERVAL_MS = 20_000L
         private const val ACTION_START = "com.solovision.openclawagents.action.START_BACKGROUND_SYNC"
         private const val ACTION_STOP = "com.solovision.openclawagents.action.STOP_BACKGROUND_SYNC"
+        private const val ACTION_START_TALK_MIC = "com.solovision.openclawagents.action.START_TALK_MIC"
+        private const val ACTION_STOP_TALK_MIC = "com.solovision.openclawagents.action.STOP_TALK_MIC"
 
         fun startIntent(context: Context): Intent {
             return Intent(context, BackgroundSyncService::class.java).apply {
@@ -180,6 +212,18 @@ class BackgroundSyncService : Service() {
         fun stopIntent(context: Context): Intent {
             return Intent(context, BackgroundSyncService::class.java).apply {
                 action = ACTION_STOP
+            }
+        }
+
+        fun startTalkMicIntent(context: Context): Intent {
+            return Intent(context, BackgroundSyncService::class.java).apply {
+                action = ACTION_START_TALK_MIC
+            }
+        }
+
+        fun stopTalkMicIntent(context: Context): Intent {
+            return Intent(context, BackgroundSyncService::class.java).apply {
+                action = ACTION_STOP_TALK_MIC
             }
         }
     }

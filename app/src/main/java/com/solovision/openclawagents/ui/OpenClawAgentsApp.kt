@@ -1,6 +1,7 @@
 package com.solovision.openclawagents.ui
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,6 +39,7 @@ import com.solovision.openclawagents.ui.screens.DashboardScreen
 import com.solovision.openclawagents.ui.screens.RoomScreen
 import com.solovision.openclawagents.ui.screens.SettingsScreen
 import com.solovision.openclawagents.ui.screens.SkillsScreen
+import com.solovision.openclawagents.ui.screens.VoiceScreen
 import com.solovision.openclawagents.ui.theme.OpenClawAgentsTheme
 
 @Composable
@@ -58,6 +60,15 @@ fun OpenClawAgentsApp(
     ) {
         viewModel.refreshNotificationPermission()
     }
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (!granted) viewModel.setTalkModeEnabled(false)
+    }
+    val hasMicPermission = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.RECORD_AUDIO
+    ) == PackageManager.PERMISSION_GRANTED
 
     LaunchedEffect(uiState.notifications.backgroundSyncEnabled, uiState.notifications.enabled) {
         if (!uiState.notifications.backgroundSyncEnabled || !uiState.notifications.enabled) {
@@ -249,6 +260,19 @@ fun OpenClawAgentsApp(
                         onToggleInternalMessages = viewModel::setShowInternalMessages,
                         onStartPolling = viewModel::startSelectedRoomPolling,
                         onStopPolling = viewModel::stopSelectedRoomPolling
+                    )
+                }
+                composable(AppDestination.Voice.route) {
+                    VoiceScreen(
+                        uiState = uiState,
+                        hasMicPermission = hasMicPermission,
+                        onRequestMicPermission = { micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
+                        onSetTalkEnabled = viewModel::setTalkModeEnabled,
+                        onStartManualMic = viewModel::startManualMicMode,
+                        onStopManualMic = viewModel::stopManualMicMode,
+                        onUpdateSpeechLocale = viewModel::updateSpeechLocale,
+                        onUpdateSilenceTimeoutMs = viewModel::updateSilenceTimeoutMs,
+                        onSetInterruptOnSpeech = viewModel::setInterruptOnSpeech
                     )
                 }
                 composable(AppDestination.Cron.route) {

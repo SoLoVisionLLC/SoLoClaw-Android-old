@@ -6,6 +6,7 @@ import com.solovision.openclawagents.model.Agent
 import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
 import com.solovision.openclawagents.model.RoomMessage
+import com.solovision.openclawagents.model.VoiceSettings
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -41,7 +42,17 @@ interface OpenClawRepository {
     suspend fun sendMessage(roomId: String, text: String)
     suspend fun createRoom(title: String, purpose: String, agentIds: List<String>): CollaborationRoom
     suspend fun deleteRoom(roomId: String)
+    suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult
 }
+
+data class TalkSpeechResult(
+    val audioBase64: String,
+    val provider: String,
+    val outputFormat: String?,
+    val mimeType: String?,
+    val fileExtension: String?,
+    val voiceCompatible: Boolean? = null
+)
 
 data class OpenClawBackendConfig(
     val gatewayUrl: String,
@@ -69,6 +80,7 @@ interface OpenClawTransport {
     suspend fun sendRoomMessage(request: SendRoomMessageRequest)
     suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom
     suspend fun deleteRoom(roomId: String)
+    suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult
 }
 
 class FakeOpenClawRepository : OpenClawRepository {
@@ -129,6 +141,10 @@ class FakeOpenClawRepository : OpenClawRepository {
         mutableRooms.removeAll { it.id == roomId }
         mutableMessages.remove(roomId)
     }
+
+    override suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult {
+        throw UnsupportedOperationException("Gateway Talk playback is unavailable in fake mode")
+    }
 }
 
 class RealOpenClawRepository(
@@ -141,6 +157,8 @@ class RealOpenClawRepository(
     override suspend fun createRoom(title: String, purpose: String, agentIds: List<String>): CollaborationRoom =
         transport.createRoom(CreateRoomRequest(title, purpose, agentIds))
     override suspend fun deleteRoom(roomId: String) = transport.deleteRoom(roomId)
+    override suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult =
+        transport.speakWithGatewayTalk(text, settings)
 }
 
 class GatewayRpcOpenClawTransport(
@@ -497,6 +515,25 @@ class GatewayRpcOpenClawTransport(
         method: String,
         params: Map<String, Any?> = emptyMap()
     ): Map<String, Any?> = request(method, params)
+
+    override suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult = withContext(dispatcher) {
+        val params = buildMap<String, Any?> {
+            put("text", text)
+            put("outputFormat", "pcm_24000")
+            settings.speechLocale.trim().takeIf { it.isNotEmpty() }?.let { put("lang", it) }
+        }
+        val response = request(method = "talk.speak", params = params)
+        val audioBase64 = response["audioBase64"] as? String
+            ?: throw IllegalStateException("talk.speak returned no audio")
+        return@withContext TalkSpeechResult(
+            audioBase64 = audioBase64,
+            provider = (response["provider"] as? String).orEmpty().ifBlank { "gateway" },
+            outputFormat = response["outputFormat"] as? String,
+            mimeType = response["mimeType"] as? String,
+            fileExtension = response["fileExtension"] as? String,
+            voiceCompatible = response["voiceCompatible"] as? Boolean
+        )
+    }
 
     suspend fun requestHttpJson(
         path: String,

@@ -29,7 +29,10 @@ class VoiceSettingsStore(context: Context? = null) {
             lemonfoxApiKey = prefs.getString(KEY_LEMONFOX_API_KEY, "").orEmpty(),
             lemonfoxVoice = prefs.getString(KEY_LEMONFOX_VOICE, "sarah").orEmpty(),
             lemonfoxLanguage = prefs.getString(KEY_LEMONFOX_LANGUAGE, "en-us").orEmpty(),
-            lemonfoxSpeed = prefs.getString(KEY_LEMONFOX_SPEED, "1.0").orEmpty()
+            lemonfoxSpeed = prefs.getString(KEY_LEMONFOX_SPEED, "1.0").orEmpty(),
+            speechLocale = prefs.getString(KEY_SPEECH_LOCALE, "").orEmpty(),
+            silenceTimeoutMs = prefs.getInt(KEY_SILENCE_TIMEOUT_MS, 700).coerceIn(300, 3_000),
+            interruptOnSpeech = prefs.getBoolean(KEY_INTERRUPT_ON_SPEECH, true)
         )
     }
 
@@ -48,6 +51,9 @@ class VoiceSettingsStore(context: Context? = null) {
             ?.putString(KEY_LEMONFOX_VOICE, settings.lemonfoxVoice)
             ?.putString(KEY_LEMONFOX_LANGUAGE, settings.lemonfoxLanguage)
             ?.putString(KEY_LEMONFOX_SPEED, settings.lemonfoxSpeed)
+            ?.putString(KEY_SPEECH_LOCALE, settings.speechLocale)
+            ?.putInt(KEY_SILENCE_TIMEOUT_MS, settings.silenceTimeoutMs.coerceIn(300, 3_000))
+            ?.putBoolean(KEY_INTERRUPT_ON_SPEECH, settings.interruptOnSpeech)
             ?.apply()
     }
 
@@ -95,6 +101,9 @@ class VoiceSettingsStore(context: Context? = null) {
         private const val KEY_LEMONFOX_VOICE = "lemonfox_voice"
         private const val KEY_LEMONFOX_LANGUAGE = "lemonfox_language"
         private const val KEY_LEMONFOX_SPEED = "lemonfox_speed"
+        private const val KEY_SPEECH_LOCALE = "speech_locale"
+        private const val KEY_SILENCE_TIMEOUT_MS = "silence_timeout_ms"
+        private const val KEY_INTERRUPT_ON_SPEECH = "interrupt_on_speech"
         private const val KEY_PROFILES = "profiles"
     }
 }
@@ -122,6 +131,9 @@ private fun VoiceSettings.toJson(): JSONObject {
         put("lemonfoxVoice", lemonfoxVoice)
         put("lemonfoxLanguage", lemonfoxLanguage)
         put("lemonfoxSpeed", lemonfoxSpeed)
+        put("speechLocale", speechLocale)
+        put("silenceTimeoutMs", silenceTimeoutMs)
+        put("interruptOnSpeech", interruptOnSpeech)
     }
 }
 
@@ -142,6 +154,9 @@ private fun JSONObject.toVoiceSettings(): VoiceSettings {
         lemonfoxApiKey = optString("lemonfoxApiKey"),
         lemonfoxVoice = optString("lemonfoxVoice").ifBlank { "sarah" },
         lemonfoxLanguage = optString("lemonfoxLanguage").ifBlank { "en-us" },
-        lemonfoxSpeed = optString("lemonfoxSpeed").ifBlank { "1.0" }
+        lemonfoxSpeed = optString("lemonfoxSpeed").ifBlank { "1.0" },
+        speechLocale = optString("speechLocale"),
+        silenceTimeoutMs = optInt("silenceTimeoutMs", 700).coerceIn(300, 3_000),
+        interruptOnSpeech = optBoolean("interruptOnSpeech", true)
     )
 }

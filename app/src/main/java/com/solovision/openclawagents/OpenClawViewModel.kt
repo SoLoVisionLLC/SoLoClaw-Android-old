@@ -1,10 +1,16 @@
 package com.solovision.openclawagents
 
 import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.core.content.ContextCompat
 import com.solovision.openclawagents.data.AgentVisibilityStore
 import com.solovision.openclawagents.data.AgentVoiceConfigStore
 import com.solovision.openclawagents.data.AppNotificationManager
@@ -29,11 +35,13 @@ import com.solovision.openclawagents.model.SkillFileEntry
 import com.solovision.openclawagents.model.SkillHubEntry
 import com.solovision.openclawagents.model.SkillSummary
 import com.solovision.openclawagents.model.TtsState
+import com.solovision.openclawagents.model.TalkPhase
 import com.solovision.openclawagents.model.VoiceOption
 import com.solovision.openclawagents.model.VoiceProfile
 import com.solovision.openclawagents.model.VoiceProvider
 import com.solovision.openclawagents.model.VoiceSettings
 import com.solovision.openclawagents.tts.ProviderBackedTtsEngine
+import com.solovision.openclawagents.tts.TalkAudioPlayer
 import com.solovision.openclawagents.tts.TtsPlaybackListener
 import com.solovision.openclawagents.tts.TtsEngine
 import kotlinx.coroutines.delay
@@ -43,8 +51,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 class OpenClawViewModel(
+    private val appContext: Context? = null,
     private val repository: OpenClawRepository = FakeOpenClawRepository(),
     private val missionControlService: MissionControlService? = null,
     private val agentVisibilityStore: AgentVisibilityStore = AgentVisibilityStore(),
@@ -62,6 +72,10 @@ class OpenClawViewModel(
     private var roomPollingJob: Job? = null
     private var messageNotificationMonitorJob: Job? = null
     private var cronNotificationMonitorJob: Job? = null
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var recognizerContinuous = false
+    private var processingTalkTurn = false
+    private val talkAudioPlayer: TalkAudioPlayer? = appContext?.let { TalkAudioPlayer(it.applicationContext) }
     private var isAppInForeground: Boolean = true
     private var agentOrderIds = agentVisibilityStore.readAgentOrderIds()
     private val initialVoiceSettings = voiceSettingsStore.read()
@@ -221,8 +235,304 @@ class OpenClawViewModel(
 
     fun setAppInForeground(inForeground: Boolean) {
         isAppInForeground = inForeground
+        if (!inForeground && _uiState.value.talkMode.manualMicActive) {
+            stopManualMicMode()
+        }
         refreshNotificationPermission()
     }
+
+    fun setTalkModeEnabled(enabled: Boolean) {
+        if (enabled) {
+            startTalkMode()
+        } else {
+            stopTalkMode()
+        }
+    }
+
+    fun startTalkMode() {
+        if (appContext == null) {
+            updateTalkState(TalkPhase.Error, "Talk Mode needs Android speech services.", error = "Android context unavailable")
+            return
+        }
+        stopManualMicMode()
+        recognizerContinuous = true
+        processingTalkTurn = false
+        _uiState.value = _uiState.value.copy(
+            talkMode = _uiState.value.talkMode.copy(
+                talkEnabled = true,
+                manualMicActive = false,
+                phase = TalkPhase.Connecting,
+                statusMessage = "Connecting Talk Mode...",
+                errorMessage = null,
+                providerStatus = "Using Gateway talk.speak when available; Android system TTS only as fallback."
+            )
+        )
+        appContext.let { context ->
+            ContextCompat.startForegroundService(context, BackgroundSyncService.startTalkMicIntent(context))
+        }
+        startSpeechRecognition(continuous = true)
+    }
+
+    fun stopTalkMode() {
+        recognizerContinuous = false
+        processingTalkTurn = false
+        stopSpeechRecognition()
+        appContext?.let { context -> runCatching { context.startService(BackgroundSyncService.stopTalkMicIntent(context)) } }
+        talkAudioPlayer?.stop()
+        ttsEngine.stop()
+        _uiState.value = _uiState.value.copy(
+            talkMode = _uiState.value.talkMode.copy(
+                talkEnabled = false,
+                manualMicActive = false,
+                phase = TalkPhase.Idle,
+                statusMessage = "Talk is idle.",
+                errorMessage = null
+            )
+        )
+    }
+
+    fun startManualMicMode() {
+        if (appContext == null) {
+            updateTalkState(TalkPhase.Error, "Mic mode needs Android speech services.", error = "Android context unavailable")
+            return
+        }
+        stopTalkMode()
+        recognizerContinuous = false
+        _uiState.value = _uiState.value.copy(
+            talkMode = _uiState.value.talkMode.copy(
+                talkEnabled = false,
+                manualMicActive = true,
+                phase = TalkPhase.Connecting,
+                statusMessage = "Starting manual Mic...",
+                errorMessage = null
+            )
+        )
+        startSpeechRecognition(continuous = false)
+    }
+
+    fun stopManualMicMode() {
+        if (!_uiState.value.talkMode.manualMicActive) return
+        recognizerContinuous = false
+        stopSpeechRecognition()
+        _uiState.value = _uiState.value.copy(
+            talkMode = _uiState.value.talkMode.copy(
+                manualMicActive = false,
+                phase = if (_uiState.value.talkMode.talkEnabled) TalkPhase.Listening else TalkPhase.Idle,
+                statusMessage = if (_uiState.value.talkMode.talkEnabled) "Listening..." else "Mic stopped."
+            )
+        )
+    }
+
+    fun updateSpeechLocale(value: String) {
+        updateVoiceSettings(_uiState.value.voiceSettings.copy(speechLocale = value.trim()))
+    }
+
+    fun updateSilenceTimeoutMs(value: Int) {
+        updateVoiceSettings(_uiState.value.voiceSettings.copy(silenceTimeoutMs = value.coerceIn(300, 3_000)))
+    }
+
+    fun setInterruptOnSpeech(enabled: Boolean) {
+        updateVoiceSettings(_uiState.value.voiceSettings.copy(interruptOnSpeech = enabled))
+    }
+
+    private fun startSpeechRecognition(continuous: Boolean) {
+        val context = appContext ?: return
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            updateTalkState(TalkPhase.Error, "Speech recognition is not available on this device.", error = "Install or enable Android speech recognition.")
+            return
+        }
+        stopSpeechRecognition()
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+            setRecognitionListener(buildRecognitionListener(continuous))
+            startListening(buildSpeechIntent())
+        }
+    }
+
+    private fun stopSpeechRecognition() {
+        speechRecognizer?.let { recognizer ->
+            runCatching { recognizer.stopListening() }
+            runCatching { recognizer.cancel() }
+            runCatching { recognizer.destroy() }
+        }
+        speechRecognizer = null
+    }
+
+    private fun buildSpeechIntent(): Intent {
+        val settings = _uiState.value.voiceSettings
+        val localeTag = settings.speechLocale.ifBlank { Locale.getDefault().toLanguageTag() }
+        return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, settings.silenceTimeoutMs.toLong())
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, settings.silenceTimeoutMs.toLong())
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
+        }
+    }
+
+    private fun buildRecognitionListener(continuous: Boolean): RecognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {
+            updateTalkState(TalkPhase.Listening, if (continuous) "Listening..." else "Listening once...")
+        }
+
+        override fun onBeginningOfSpeech() {
+            if (_uiState.value.voiceSettings.interruptOnSpeech) {
+                talkAudioPlayer?.stop()
+                ttsEngine.stop()
+            }
+            updateTalkState(TalkPhase.Listening, "Listening...")
+        }
+
+        override fun onRmsChanged(rmsdB: Float) = Unit
+        override fun onBufferReceived(buffer: ByteArray?) = Unit
+        override fun onEndOfSpeech() {
+            updateTalkState(TalkPhase.Thinking, "Asking OpenClaw...")
+        }
+
+        override fun onError(error: Int) {
+            val active = if (continuous) _uiState.value.talkMode.talkEnabled else _uiState.value.talkMode.manualMicActive
+            if (continuous && active && error in restartableSpeechErrors) {
+                restartListeningSoon()
+            } else {
+                updateTalkState(TalkPhase.Error, "Speech recognition error.", error = speechErrorLabel(error))
+                if (!continuous) stopManualMicMode()
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            val transcript = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+                ?.trim()
+                .orEmpty()
+            if (transcript.isBlank()) {
+                if (continuous && _uiState.value.talkMode.talkEnabled) restartListeningSoon() else stopManualMicMode()
+                return
+            }
+            processRecognizedSpeech(transcript, continuous)
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+                ?.trim()
+                .orEmpty()
+            if (partial.isNotBlank()) {
+                _uiState.value = _uiState.value.copy(
+                    talkMode = _uiState.value.talkMode.copy(lastTranscript = partial)
+                )
+            }
+        }
+
+        override fun onEvent(eventType: Int, params: Bundle?) = Unit
+    }
+
+    private fun processRecognizedSpeech(transcript: String, continuous: Boolean) {
+        if (processingTalkTurn) return
+        processingTalkTurn = true
+        _uiState.value = _uiState.value.copy(
+            talkMode = _uiState.value.talkMode.copy(
+                phase = TalkPhase.Thinking,
+                lastTranscript = transcript,
+                statusMessage = "Asking OpenClaw...",
+                errorMessage = null
+            )
+        )
+        viewModelScope.launch {
+            val roomId = _uiState.value.selectedRoomId ?: _uiState.value.rooms.firstOrNull()?.id
+            if (roomId == null) {
+                updateTalkState(TalkPhase.Error, "No OpenClaw session is selected.", error = "Open Chat and select a session first.")
+                processingTalkTurn = false
+                return@launch
+            }
+            val previousAssistantKey = _uiState.value.roomMessages[roomId]
+                .orEmpty()
+                .lastOrNull { it.senderType == MessageSenderType.AGENT && !it.internal }
+                ?.messageKey
+            runCatching {
+                repository.sendMessage(roomId, transcript)
+                val answer = awaitLatestAssistantReply(roomId, previousAssistantKey)
+                    ?: throw IllegalStateException("OpenClaw did not return a spoken reply before timeout.")
+                speakTalkAnswer(answer.body)
+                refreshMessages(roomId)
+            }.onFailure { error ->
+                Log.w(logTag, "Talk turn failed", error)
+                updateTalkState(TalkPhase.Error, "Talk turn failed.", error = error.message ?: "Unknown Talk error")
+            }
+            processingTalkTurn = false
+            if (continuous && _uiState.value.talkMode.talkEnabled) {
+                restartListeningSoon()
+            } else {
+                stopManualMicMode()
+            }
+        }
+    }
+
+    private suspend fun awaitLatestAssistantReply(roomId: String, previousAssistantKey: String?): RoomMessage? {
+        repeat(8) {
+            delay(900)
+            val messages = repository.getRoomMessages(roomId)
+            _uiState.value = _uiState.value.copy(
+                roomMessages = _uiState.value.roomMessages + (roomId to messages)
+            )
+            val latest = messages.lastOrNull { it.senderType == MessageSenderType.AGENT && !it.internal }
+            if (latest != null && latest.messageKey != previousAssistantKey) return latest
+        }
+        return null
+    }
+
+    private suspend fun speakTalkAnswer(text: String) {
+        updateTalkState(TalkPhase.Speaking, "Speaking...")
+        runCatching {
+            val speech = repository.speakWithGatewayTalk(text, _uiState.value.voiceSettings)
+            talkAudioPlayer?.play(speech.audioBase64, speech.outputFormat, speech.mimeType, speech.fileExtension)
+                ?: error("Android Talk audio player unavailable")
+            _uiState.value = _uiState.value.copy(
+                talkMode = _uiState.value.talkMode.copy(providerStatus = "Gateway Talk provider: ${speech.provider}")
+            )
+        }.onFailure { gatewayError ->
+            Log.w(logTag, "talk.speak failed; falling back to Android system TTS", gatewayError)
+            _uiState.value = _uiState.value.copy(
+                talkMode = _uiState.value.talkMode.copy(providerStatus = "Gateway talk.speak unavailable; used Android system TTS fallback.")
+            )
+            ttsEngine.speak(text, _uiState.value.voiceSettings.copy(provider = VoiceProvider.System))
+        }
+    }
+
+    private fun restartListeningSoon() {
+        viewModelScope.launch {
+            delay(250)
+            if (_uiState.value.talkMode.talkEnabled) startSpeechRecognition(continuous = true)
+        }
+    }
+
+    private fun updateTalkState(phase: TalkPhase, status: String, error: String? = null) {
+        _uiState.value = _uiState.value.copy(
+            talkMode = _uiState.value.talkMode.copy(
+                phase = phase,
+                statusMessage = status,
+                errorMessage = error
+            )
+        )
+    }
+
+    private fun speechErrorLabel(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_AUDIO -> "Audio recording error."
+        SpeechRecognizer.ERROR_CLIENT -> "Speech client error."
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission is required."
+        SpeechRecognizer.ERROR_NETWORK -> "Network error during speech recognition."
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech recognition network timeout."
+        SpeechRecognizer.ERROR_NO_MATCH -> "No speech heard."
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer is busy."
+        SpeechRecognizer.ERROR_SERVER -> "Speech recognition server error."
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Speech timed out."
+        else -> "Speech recognition error $error."
+    }
+
+    private val restartableSpeechErrors = setOf(
+        SpeechRecognizer.ERROR_NO_MATCH,
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
+        SpeechRecognizer.ERROR_CLIENT
+    )
 
     fun refreshNotificationPermission() {
         val permissionGranted = appNotificationManager?.hasPermission() ?: true
@@ -1933,6 +2243,8 @@ class OpenClawViewModel(
         roomPollingJob?.cancel()
         messageNotificationMonitorJob?.cancel()
         cronNotificationMonitorJob?.cancel()
+        stopSpeechRecognition()
+        talkAudioPlayer?.stop()
         ttsEngine.shutdown()
         super.onCleared()
     }
@@ -1943,6 +2255,7 @@ class OpenClawViewModel(
                 val runtime = buildOpenClawRuntimeDependencies(context)
                 @Suppress("UNCHECKED_CAST")
                 return OpenClawViewModel(
+                    appContext = context.applicationContext,
                     repository = runtime.repository,
                     missionControlService = runtime.missionControlService,
                     agentVisibilityStore = AgentVisibilityStore(context),
