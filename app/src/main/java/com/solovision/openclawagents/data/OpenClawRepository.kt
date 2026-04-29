@@ -7,8 +7,10 @@ import com.solovision.openclawagents.model.CollaborationRoom
 import com.solovision.openclawagents.model.MessageSenderType
 import com.solovision.openclawagents.model.RoomMessage
 import com.solovision.openclawagents.model.VoiceSettings
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -22,6 +24,7 @@ import okio.ByteString
 import java.net.URI
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -43,6 +46,8 @@ interface OpenClawRepository {
     suspend fun createRoom(title: String, purpose: String, agentIds: List<String>): CollaborationRoom
     suspend fun deleteRoom(roomId: String)
     suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult
+    suspend fun createRealtimeTalkSession(sessionKey: String): TalkRealtimeSessionResult
+    suspend fun openRealtimeEventClient(onEvent: (GatewayEvent) -> Unit): GatewayEventClient
 }
 
 data class TalkSpeechResult(
@@ -53,6 +58,32 @@ data class TalkSpeechResult(
     val fileExtension: String?,
     val voiceCompatible: Boolean? = null
 )
+
+data class TalkRealtimeAudioConfig(
+    val inputEncoding: String,
+    val inputSampleRateHz: Int,
+    val outputEncoding: String,
+    val outputSampleRateHz: Int
+)
+
+data class TalkRealtimeSessionResult(
+    val provider: String,
+    val transport: String?,
+    val relaySessionId: String?,
+    val audio: TalkRealtimeAudioConfig?,
+    val model: String? = null,
+    val voice: String? = null
+)
+
+data class GatewayEvent(
+    val event: String,
+    val payload: Map<String, Any?>
+)
+
+interface GatewayEventClient {
+    suspend fun request(method: String, params: Map<String, Any?> = emptyMap()): Map<String, Any?>
+    fun close()
+}
 
 data class OpenClawBackendConfig(
     val gatewayUrl: String,
@@ -81,6 +112,8 @@ interface OpenClawTransport {
     suspend fun createRoom(request: CreateRoomRequest): CollaborationRoom
     suspend fun deleteRoom(roomId: String)
     suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult
+    suspend fun createRealtimeTalkSession(sessionKey: String): TalkRealtimeSessionResult
+    suspend fun openRealtimeEventClient(onEvent: (GatewayEvent) -> Unit): GatewayEventClient
 }
 
 class FakeOpenClawRepository : OpenClawRepository {
@@ -145,6 +178,14 @@ class FakeOpenClawRepository : OpenClawRepository {
     override suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult {
         throw UnsupportedOperationException("Gateway Talk playback is unavailable in fake mode")
     }
+
+    override suspend fun createRealtimeTalkSession(sessionKey: String): TalkRealtimeSessionResult {
+        throw UnsupportedOperationException("Realtime Gateway Talk is unavailable in fake mode")
+    }
+
+    override suspend fun openRealtimeEventClient(onEvent: (GatewayEvent) -> Unit): GatewayEventClient {
+        throw UnsupportedOperationException("Realtime Gateway events are unavailable in fake mode")
+    }
 }
 
 class RealOpenClawRepository(
@@ -159,6 +200,10 @@ class RealOpenClawRepository(
     override suspend fun deleteRoom(roomId: String) = transport.deleteRoom(roomId)
     override suspend fun speakWithGatewayTalk(text: String, settings: VoiceSettings): TalkSpeechResult =
         transport.speakWithGatewayTalk(text, settings)
+    override suspend fun createRealtimeTalkSession(sessionKey: String): TalkRealtimeSessionResult =
+        transport.createRealtimeTalkSession(sessionKey)
+    override suspend fun openRealtimeEventClient(onEvent: (GatewayEvent) -> Unit): GatewayEventClient =
+        transport.openRealtimeEventClient(onEvent)
 }
 
 class GatewayRpcOpenClawTransport(
@@ -535,6 +580,33 @@ class GatewayRpcOpenClawTransport(
         )
     }
 
+    override suspend fun createRealtimeTalkSession(sessionKey: String): TalkRealtimeSessionResult = withContext(dispatcher) {
+        val response = request(
+            method = "talk.realtime.session",
+            params = mapOf("sessionKey" to sessionKey)
+        )
+        val audio = (response["audio"] as? Map<*, *>)?.let { raw ->
+            TalkRealtimeAudioConfig(
+                inputEncoding = (raw["inputEncoding"] as? String).orEmpty(),
+                inputSampleRateHz = (raw["inputSampleRateHz"] as? Number)?.toInt() ?: 24_000,
+                outputEncoding = (raw["outputEncoding"] as? String).orEmpty(),
+                outputSampleRateHz = (raw["outputSampleRateHz"] as? Number)?.toInt() ?: 24_000
+            )
+        }
+        TalkRealtimeSessionResult(
+            provider = (response["provider"] as? String).orEmpty().ifBlank { "gateway" },
+            transport = response["transport"] as? String,
+            relaySessionId = response["relaySessionId"] as? String,
+            audio = audio,
+            model = response["model"] as? String,
+            voice = response["voice"] as? String
+        )
+    }
+
+    override suspend fun openRealtimeEventClient(onEvent: (GatewayEvent) -> Unit): GatewayEventClient = withContext(dispatcher) {
+        PersistentGatewayEventClient(onEvent).also { it.connect() }
+    }
+
     suspend fun requestHttpJson(
         path: String,
         method: String = "GET",
@@ -844,6 +916,197 @@ class GatewayRpcOpenClawTransport(
                     }
                 }
             })
+        }
+    }
+
+    private inner class PersistentGatewayEventClient(
+        private val onEvent: (GatewayEvent) -> Unit
+    ) : GatewayEventClient {
+        private val pending = ConcurrentHashMap<String, CompletableDeferred<Map<String, Any?>>>()
+        private var webSocket: WebSocket? = null
+        private var connected = CompletableDeferred<Unit>()
+        private val clientId = "openclaw-android"
+        private val instanceId = UUID.randomUUID().toString()
+        private val connectRequestId = UUID.randomUUID().toString()
+        private val storedDeviceAuth = deviceAuthStore.read()
+        private var connectNonce: String? = null
+        private var grantedScopes: List<String> = storedDeviceAuth.grantedScopes
+        private var deviceToken: String? = storedDeviceAuth.deviceToken
+
+        suspend fun connect() {
+            val wsRequest = Request.Builder().url(config.gatewayUrl).build()
+            webSocket = client.newWebSocket(wsRequest, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    Log.d("OpenClawGateway", "Persistent socket opened url=${config.gatewayUrl}")
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    handleMessage(text)
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    handleMessage(bytes.utf8())
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    if (!connected.isCompleted) connected.completeExceptionally(t)
+                    pending.values.forEach { it.completeExceptionally(t) }
+                    pending.clear()
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    val error = IllegalStateException("Gateway socket closed: $code $reason")
+                    if (!connected.isCompleted) connected.completeExceptionally(error)
+                    pending.values.forEach { it.completeExceptionally(error) }
+                    pending.clear()
+                }
+            })
+            connected.await()
+        }
+
+        override suspend fun request(method: String, params: Map<String, Any?>): Map<String, Any?> {
+            connected.await()
+            val id = UUID.randomUUID().toString()
+            val deferred = CompletableDeferred<Map<String, Any?>>()
+            pending[id] = deferred
+            sendRpc(id, method, params)
+            return deferred.await()
+        }
+
+        override fun close() {
+            pending.values.forEach { it.cancel() }
+            pending.clear()
+            webSocket?.close(1000, null)
+            webSocket = null
+        }
+
+        private fun handleMessage(text: String) {
+            try {
+                val parsed = SimpleJson.parseObject(text)
+                when (parsed["type"] as? String) {
+                    "event" -> {
+                        val event = parsed["event"] as? String
+                        val payload = parsed["payload"] as? Map<*, *>
+                        when (event) {
+                            "connect.challenge" -> {
+                                connectNonce = payload?.get("nonce") as? String
+                                sendRpc(connectRequestId, "connect", buildConnectParams(connectNonce))
+                            }
+                            "hello" -> extractAndPersistDeviceAuth(payload)
+                            null -> Unit
+                            else -> {
+                                @Suppress("UNCHECKED_CAST")
+                                onEvent(GatewayEvent(event, payload as? Map<String, Any?> ?: emptyMap()))
+                            }
+                        }
+                    }
+                    "res" -> handleResponse(parsed)
+                }
+            } catch (t: Throwable) {
+                Log.w("OpenClawGateway", "Persistent socket message failed", t)
+            }
+        }
+
+        private fun handleResponse(parsed: Map<String, Any?>) {
+            val id = parsed["id"] as? String ?: return
+            val ok = parsed["ok"] as? Boolean ?: false
+            if (id == connectRequestId) {
+                if (!ok) {
+                    val error = parsed["error"] as? Map<*, *>
+                    connected.completeExceptionally(IllegalStateException(error?.get("message") as? String ?: "Gateway connect failed"))
+                    return
+                }
+                extractAndPersistDeviceAuth(parsed["payload"] as? Map<*, *>)
+                connected.complete(Unit)
+                return
+            }
+            val deferred = pending.remove(id) ?: return
+            if (!ok) {
+                val error = parsed["error"] as? Map<*, *>
+                deferred.completeExceptionally(IllegalStateException(error?.get("message") as? String ?: "Gateway RPC failed"))
+                return
+            }
+            @Suppress("UNCHECKED_CAST")
+            deferred.complete(parsed["payload"] as? Map<String, Any?> ?: emptyMap())
+        }
+
+        private fun sendRpc(id: String, rpcMethod: String, rpcParams: Map<String, Any?>) {
+            val payload = mapOf(
+                "type" to "req",
+                "id" to id,
+                "method" to rpcMethod,
+                "params" to rpcParams
+            )
+            webSocket?.send(SimpleJson.stringify(payload))
+        }
+
+        private fun persistDeviceAuth(updatedDeviceToken: String?, updatedGrantedScopes: List<String>) {
+            deviceToken = updatedDeviceToken ?: deviceToken
+            grantedScopes = updatedGrantedScopes.ifEmpty { grantedScopes }
+            deviceAuthStore.write(deviceToken, grantedScopes)
+        }
+
+        private fun extractAndPersistDeviceAuth(source: Map<*, *>?) {
+            val auth = source?.get("auth") as? Map<*, *>
+            val nextDeviceToken = auth?.get("deviceToken") as? String
+            val nextScopes = (auth?.get("scopes") as? List<*>)
+                ?.mapNotNull { it as? String }
+                .orEmpty()
+            if (nextDeviceToken != null || nextScopes.isNotEmpty()) {
+                persistDeviceAuth(nextDeviceToken, nextScopes)
+            }
+        }
+
+        private fun buildConnectParams(nonce: String?): Map<String, Any?> {
+            val sharedToken = config.apiKey?.takeIf { it.isNotBlank() }
+            val auth = buildMap<String, Any?> {
+                sharedToken?.let { put("token", it) }
+                config.password?.takeIf { it.isNotBlank() }?.let { put("password", it) }
+            }.takeIf { it.isNotEmpty() }
+            val device = nonce?.takeIf { it.isNotBlank() }?.let { challenge ->
+                val signedAt = System.currentTimeMillis()
+                val deviceId = deviceIdentity.deviceId()
+                val publicKey = deviceIdentity.publicKeyBase64Url()
+                val payload = buildDeviceAuthPayloadV3(
+                    deviceId = deviceId,
+                    clientId = clientId,
+                    clientMode = "ui",
+                    role = "operator",
+                    scopes = REQUESTED_OPERATOR_SCOPES,
+                    signedAtMs = signedAt,
+                    token = sharedToken,
+                    nonce = challenge,
+                    platform = "android",
+                    deviceFamily = "Android"
+                )
+                val signature = deviceIdentity.signPayload(payload)
+                mapOf(
+                    "id" to deviceId,
+                    "publicKey" to publicKey,
+                    "signature" to signature,
+                    "signedAt" to signedAt,
+                    "nonce" to challenge
+                )
+            }
+            return buildMap {
+                put("minProtocol", 3)
+                put("maxProtocol", 3)
+                put("client", mapOf(
+                    "id" to clientId,
+                    "displayName" to config.deviceLabel,
+                    "version" to "0.1.0",
+                    "platform" to "android",
+                    "deviceFamily" to "Android",
+                    "mode" to "ui",
+                    "instanceId" to instanceId
+                ))
+                put("role", "operator")
+                put("scopes", REQUESTED_OPERATOR_SCOPES)
+                auth?.let { put("auth", it) }
+                device?.let { put("device", it) }
+                put("userAgent", "OpenClaw Agents Android/0.1.0")
+                put("locale", java.util.Locale.getDefault().toLanguageTag())
+            }
         }
     }
 
