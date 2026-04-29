@@ -77,7 +77,29 @@ data class VoiceSettings(
     val lemonfoxApiKey: String = "",
     val lemonfoxVoice: String = "sarah",
     val lemonfoxLanguage: String = "en-us",
-    val lemonfoxSpeed: String = "1.0"
+    val lemonfoxSpeed: String = "1.0",
+    val speechLocale: String = "",
+    val silenceTimeoutMs: Int = 700,
+    val interruptOnSpeech: Boolean = true
+)
+
+enum class TalkPhase {
+    Idle,
+    Connecting,
+    Listening,
+    Thinking,
+    Speaking,
+    Error
+}
+
+data class TalkModeState(
+    val talkEnabled: Boolean = false,
+    val manualMicActive: Boolean = false,
+    val phase: TalkPhase = TalkPhase.Idle,
+    val lastTranscript: String = "",
+    val statusMessage: String = "Talk is idle.",
+    val errorMessage: String? = null,
+    val providerStatus: String = "Gateway Talk provider preferred; Android system TTS fallback is ready."
 )
 
 data class VoiceProfile(
@@ -289,6 +311,7 @@ data class AppUiState(
     val roomMessages: Map<String, List<RoomMessage>> = emptyMap(),
     val voiceSettings: VoiceSettings = VoiceSettings(),
     val ttsState: TtsState = TtsState(),
+    val talkMode: TalkModeState = TalkModeState(),
     val agentVoiceConfigs: Map<String, AgentVoiceConfig> = emptyMap(),
     val creatingRoom: Boolean = false,
     val managingAgents: Boolean = false,

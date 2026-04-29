@@ -111,6 +111,18 @@ class AppNotificationManager(
             .build()
     }
 
+    fun buildTalkModeNotification(): android.app.Notification {
+        return NotificationCompat.Builder(context, BACKGROUND_SYNC_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("OpenClaw Talk Mode")
+            .setContentText("Listening for continuous Talk Mode turns.")
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(mainPendingIntent("voice"))
+            .build()
+    }
+
     private fun mainPendingIntent(target: String): PendingIntent {
         val intent = Intent(context, MainActivity::class.java).apply {
             flags =
