@@ -41,6 +41,7 @@ import com.solovision.openclawagents.model.VoiceProfile
 import com.solovision.openclawagents.model.VoiceProvider
 import com.solovision.openclawagents.model.VoiceSettings
 import com.solovision.openclawagents.tts.ProviderBackedTtsEngine
+import com.solovision.openclawagents.tts.RealtimeTalkRelay
 import com.solovision.openclawagents.tts.TalkAudioPlayer
 import com.solovision.openclawagents.tts.TtsPlaybackListener
 import com.solovision.openclawagents.tts.TtsEngine
@@ -75,6 +76,7 @@ class OpenClawViewModel(
     private var speechRecognizer: SpeechRecognizer? = null
     private var recognizerContinuous = false
     private var processingTalkTurn = false
+    private var realtimeTalkRelay: RealtimeTalkRelay? = null
     private val talkAudioPlayer: TalkAudioPlayer? = appContext?.let { TalkAudioPlayer(it.applicationContext) }
     private var isAppInForeground: Boolean = true
     private var agentOrderIds = agentVisibilityStore.readAgentOrderIds()
@@ -250,32 +252,69 @@ class OpenClawViewModel(
     }
 
     fun startTalkMode() {
-        if (appContext == null) {
+        val context = appContext
+        if (context == null) {
             updateTalkState(TalkPhase.Error, "Talk Mode needs Android speech services.", error = "Android context unavailable")
             return
         }
         stopManualMicMode()
-        recognizerContinuous = true
+        recognizerContinuous = false
         processingTalkTurn = false
+        realtimeTalkRelay?.stop()
+        realtimeTalkRelay = null
         _uiState.value = _uiState.value.copy(
             talkMode = _uiState.value.talkMode.copy(
                 talkEnabled = true,
                 manualMicActive = false,
                 phase = TalkPhase.Connecting,
-                statusMessage = "Connecting Talk Mode...",
+                statusMessage = "Connecting realtime Talk Mode...",
                 errorMessage = null,
-                providerStatus = "Using Gateway talk.speak when available; Android system TTS only as fallback."
+                providerStatus = "Trying Gateway realtime relay; phased talk.speak remains fallback."
             )
         )
-        appContext.let { context ->
-            ContextCompat.startForegroundService(context, BackgroundSyncService.startTalkMicIntent(context))
+        ContextCompat.startForegroundService(context, BackgroundSyncService.startTalkMicIntent(context))
+        viewModelScope.launch {
+            val sessionKey = _uiState.value.selectedRoomId ?: _uiState.value.rooms.firstOrNull()?.id
+            if (sessionKey == null) {
+                updateTalkState(TalkPhase.Error, "No OpenClaw session is selected.", error = "Open Chat and select a session first.")
+                return@launch
+            }
+            val relay = RealtimeTalkRelay(
+                context = context.applicationContext,
+                repository = repository,
+                sessionKey = sessionKey,
+                callbacks = buildRealtimeTalkCallbacks(sessionKey)
+            )
+            runCatching {
+                relay.start()
+            }.onSuccess {
+                realtimeTalkRelay = relay
+                _uiState.value = _uiState.value.copy(
+                    talkMode = _uiState.value.talkMode.copy(
+                        providerStatus = "Gateway realtime relay active; provider secrets stay on the Gateway."
+                    )
+                )
+            }.onFailure { error ->
+                Log.w(logTag, "Realtime Talk unavailable; falling back to phased SpeechRecognizer mode", error)
+                relay.stop()
+                if (_uiState.value.talkMode.talkEnabled) {
+                    _uiState.value = _uiState.value.copy(
+                        talkMode = _uiState.value.talkMode.copy(
+                            providerStatus = "Realtime relay unavailable (${error.message}); using phased chat.send + talk.speak fallback."
+                        )
+                    )
+                    recognizerContinuous = true
+                    startSpeechRecognition(continuous = true)
+                }
+            }
         }
-        startSpeechRecognition(continuous = true)
     }
 
     fun stopTalkMode() {
         recognizerContinuous = false
         processingTalkTurn = false
+        realtimeTalkRelay?.stop()
+        realtimeTalkRelay = null
         stopSpeechRecognition()
         appContext?.let { context -> runCatching { context.startService(BackgroundSyncService.stopTalkMicIntent(context)) } }
         talkAudioPlayer?.stop()
@@ -334,6 +373,53 @@ class OpenClawViewModel(
     fun setInterruptOnSpeech(enabled: Boolean) {
         updateVoiceSettings(_uiState.value.voiceSettings.copy(interruptOnSpeech = enabled))
     }
+
+    private fun buildRealtimeTalkCallbacks(sessionKey: String): RealtimeTalkRelay.Callbacks =
+        object : RealtimeTalkRelay.Callbacks {
+            override fun onStatus(status: RealtimeTalkRelay.Status, detail: String?) {
+                val phase = when (status) {
+                    RealtimeTalkRelay.Status.Connecting -> TalkPhase.Connecting
+                    RealtimeTalkRelay.Status.Listening -> TalkPhase.Listening
+                    RealtimeTalkRelay.Status.Speaking -> TalkPhase.Speaking
+                    RealtimeTalkRelay.Status.Error -> TalkPhase.Error
+                    RealtimeTalkRelay.Status.Closed -> if (_uiState.value.talkMode.talkEnabled) TalkPhase.Idle else TalkPhase.Idle
+                }
+                val message = detail ?: when (status) {
+                    RealtimeTalkRelay.Status.Connecting -> "Connecting realtime Talk..."
+                    RealtimeTalkRelay.Status.Listening -> "Realtime listening..."
+                    RealtimeTalkRelay.Status.Speaking -> "Realtime speaking..."
+                    RealtimeTalkRelay.Status.Error -> "Realtime Talk error."
+                    RealtimeTalkRelay.Status.Closed -> "Realtime Talk stopped."
+                }
+                _uiState.value = _uiState.value.copy(
+                    talkMode = _uiState.value.talkMode.copy(
+                        phase = phase,
+                        statusMessage = message,
+                        errorMessage = if (status == RealtimeTalkRelay.Status.Error) detail else null
+                    )
+                )
+            }
+
+            override fun onTranscript(role: String, text: String, final: Boolean) {
+                if (role == "user") {
+                    _uiState.value = _uiState.value.copy(
+                        talkMode = _uiState.value.talkMode.copy(lastTranscript = text)
+                    )
+                }
+            }
+
+            override suspend fun onAgentConsult(question: String): String {
+                val previousAssistantKey = _uiState.value.roomMessages[sessionKey]
+                    .orEmpty()
+                    .lastOrNull { it.senderType == MessageSenderType.AGENT && !it.internal }
+                    ?.messageKey
+                repository.sendMessage(sessionKey, question.ifBlank { "Continue the voice conversation." })
+                val answer = awaitLatestAssistantReply(sessionKey, previousAssistantKey)
+                    ?: return "OpenClaw did not return a reply before the realtime tool timeout."
+                refreshMessages(sessionKey)
+                return answer.body
+            }
+        }
 
     private fun startSpeechRecognition(continuous: Boolean) {
         val context = appContext ?: return
