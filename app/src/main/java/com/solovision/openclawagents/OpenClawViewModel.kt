@@ -160,22 +160,23 @@ class OpenClawViewModel(
             }
 
             private fun buildRepository(): OpenClawRepository {
-                val gatewayUrl = "wss://gateway.solobot.cloud"
-                val sessionKey = "agent:orion:main"
-                return runCatching {
-                    RealOpenClawRepository(
-                        GatewayRpcOpenClawTransport(
-                            context = context,
-                            config = OpenClawBackendConfig(
-                                gatewayUrl = gatewayUrl,
-                                sessionKey = sessionKey,
-                                apiKey = "19ca7975c4842989d999110a09569394b203ef14916a4f08187f3e1482197633"
-                            )
+                val gatewayUrl = BuildConfig.OPENCLAW_GATEWAY_URL.trim()
+                val sessionKey = BuildConfig.OPENCLAW_SESSION_KEY.trim()
+
+                if (gatewayUrl.isBlank() || sessionKey.isBlank()) {
+                    return FakeOpenClawRepository()
+                }
+
+                return RealOpenClawRepository(
+                    GatewayRpcOpenClawTransport(
+                        context = context,
+                        config = OpenClawBackendConfig(
+                            gatewayUrl = gatewayUrl,
+                            sessionKey = sessionKey,
+                            apiKey = BuildConfig.OPENCLAW_API_KEY.takeIf { it.isNotBlank() }
                         )
                     )
-                }.getOrElse {
-                    FakeOpenClawRepository()
-                }
+                )
             }
         }
     }

@@ -8,6 +8,19 @@ android {
     namespace = "com.solovision.openclawagents"
     compileSdk = 35
 
+    fun secretString(name: String): String =
+        (project.findProperty(name) as? String)
+            ?: System.getenv(name)
+            ?: ""
+
+    fun configString(name: String, defaultValue: String): String =
+        (project.findProperty(name) as? String)
+            ?: System.getenv(name)
+            ?: defaultValue
+
+    fun buildConfigString(value: String): String =
+        "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
     defaultConfig {
         applicationId = "com.solovision.openclawagents"
         minSdk = 26
@@ -16,6 +29,10 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "OPENCLAW_GATEWAY_URL", buildConfigString(configString("OPENCLAW_GATEWAY_URL", "wss://gateway.solobot.cloud")))
+        buildConfigField("String", "OPENCLAW_SESSION_KEY", buildConfigString(configString("OPENCLAW_SESSION_KEY", "agent:orion:main")))
+        buildConfigField("String", "OPENCLAW_API_KEY", buildConfigString(secretString("OPENCLAW_API_KEY")))
     }
 
     buildTypes {
@@ -39,6 +56,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

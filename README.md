@@ -32,3 +32,20 @@ It is a mobile command surface for:
 ## Status
 
 Fresh repo scaffold in progress.
+
+## Gateway configuration
+
+The app uses the real Hermes/OpenClaw gateway transport when `OPENCLAW_GATEWAY_URL` and `OPENCLAW_SESSION_KEY` are configured. Defaults point at the production gateway route and Orion's main session:
+
+- `OPENCLAW_GATEWAY_URL=wss://gateway.solobot.cloud`
+- `OPENCLAW_SESSION_KEY=agent:orion:main`
+
+Set `OPENCLAW_API_KEY` from an environment variable or Gradle property when a shared gateway token is required. Do not commit API keys or secrets.
+
+Example local build:
+
+```bash
+OPENCLAW_API_KEY=... ./gradlew :app:assembleDebug
+```
+
+The fake repository fallback is only used when the gateway URL or session key is deliberately left blank.
